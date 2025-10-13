@@ -1,346 +1,950 @@
 const express = require("express");
-const axios = require("axios");
 const cors = require("cors");
+const { Pool } = require("pg");
 require("dotenv").config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const { PORT, ODOO_URL, ODOO_DB, ODOO_LOGIN, ODOO_API_KEY } = process.env;
-let UID = null;
+// Configuración PostgreSQL
+const pool = new Pool({
+  user: process.env.DB_USER || 'postgres',
+  host: process.env.DB_HOST || 'localhost',
+  database: process.env.DB_NAME || 'alfa_mobile_db',
+  password: process.env.DB_PASSWORD || 'tu_password',
+  port: process.env.DB_PORT || 5433,
+});
 
-// Autenticación contra Odoo (usa API Key como password)
-async function authenticate() {
-  const res = await axios.post(`${ODOO_URL}/web/session/authenticate`, {
-    jsonrpc: "2.0",
-    method: "call",
-    params: { db: ODOO_DB, login: ODOO_LOGIN, password: ODOO_API_KEY },
-    id: Date.now()
-  }, { headers: { "Content-Type": "application/json" }});
-  const uid = res.data?.result?.uid;
-  if (!uid) throw new Error("No se pudo autenticar contra Odoo");
-  UID = uid;
+// Función para crear todas las tablas
+async function crearTablas() {
+  try {
+    console.log("🔄 Creando tablas en PostgreSQL...");
+
+    // Tabla puestos
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS puestos (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Tabla empleados
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS empleados (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        work_email VARCHAR(255),
+        work_phone VARCHAR(100),
+        identification_id VARCHAR(50),
+        job_id INTEGER REFERENCES puestos(id),
+        fecha_ingreso DATE,
+        salario DECIMAL(10,2),
+        activo BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Tabla clientes
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS clientes (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255),
+        phone VARCHAR(100),
+        vat VARCHAR(20),
+        street VARCHAR(255),
+        city VARCHAR(100),
+        customer_rank INTEGER DEFAULT 1,
+        activo BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Tabla proveedores
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS proveedores (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255),
+        phone VARCHAR(100),
+        vat VARCHAR(20),
+        supplier_rank INTEGER DEFAULT 1,
+        activo BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Tabla productos
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS productos (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        sku VARCHAR(100),
+        price DECIMAL(10,2) DEFAULT 0,
+        cost DECIMAL(10,2) DEFAULT 0,
+        barcode VARCHAR(100),
+        type VARCHAR(50) DEFAULT 'consu',
+        activo BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Tabla ventas
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ventas (
+        id SERIAL PRIMARY KEY,
+        cliente_id INTEGER REFERENCES clientes(id),
+        date_order DATE NOT NULL,
+        amount_total DECIMAL(10,2) DEFAULT 0,
+        state VARCHAR(50) DEFAULT 'draft',
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Tabla inventario
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS inventario (
+        id SERIAL PRIMARY KEY,
+        product_id INTEGER REFERENCES productos(id),
+        location_name VARCHAR(255),
+        quantity DECIMAL(10,2) DEFAULT 0,
+        reserved_quantity DECIMAL(10,2) DEFAULT 0,
+        available_quantity DECIMAL(10,2) DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // ============ NUEVAS TABLAS PARA EL SISTEMA DE PROVEEDORES ============
+
+    // Tabla marcas (global para todos los proveedores)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS marcas (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL UNIQUE,
+        descripcion TEXT,
+        activo BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Tabla modelos (global para todos los proveedores)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS modelos (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        marca_id INTEGER REFERENCES marcas(id),
+        descripcion TEXT,
+        activo BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(name, marca_id)
+      )
+    `);
+
+    // Tabla pedidos (de proveedores)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pedidos_proveedor (
+        id SERIAL PRIMARY KEY,
+        proveedor_id INTEGER REFERENCES proveedores(id),
+        numero_pedido VARCHAR(100) UNIQUE,
+        fecha_pedido DATE NOT NULL,
+        fecha_entrega DATE,
+        estado VARCHAR(50) DEFAULT 'pendiente',
+        total DECIMAL(12,2) DEFAULT 0,
+        observaciones TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Tabla productos_detallados (cada producto con IMEI único)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS productos_detallados (
+        id SERIAL PRIMARY KEY,
+        pedido_id INTEGER REFERENCES pedidos_proveedor(id),
+        modelo_id INTEGER REFERENCES modelos(id),
+        imei_1 VARCHAR(20) UNIQUE,
+        imei_2 VARCHAR(20),
+        costo DECIMAL(10,2) NOT NULL,
+        fecha_ingreso DATE NOT NULL,
+        estado VARCHAR(50) DEFAULT 'en_stock',
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Tabla cuentas_por_pagar
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cuentas_por_pagar (
+        id SERIAL PRIMARY KEY,
+        proveedor_id INTEGER REFERENCES proveedores(id),
+        pedido_id INTEGER REFERENCES pedidos_proveedor(id),
+        monto DECIMAL(12,2) NOT NULL,
+        fecha_vencimiento DATE,
+        estado VARCHAR(50) DEFAULT 'pendiente',
+        descripcion TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    console.log("✅ Todas las tablas creadas en PostgreSQL");
+  } catch (error) {
+    console.error("❌ Error creando tablas:", error);
+  }
 }
 
-async function odooExecute(model, method, args = [], kwargs = {}) {
-  if (!UID) await authenticate();
-  const body = {
-    jsonrpc: "2.0",
-    method: "call",
-    params: {
-      service: "object",
-      method: "execute_kw",
-      args: [ODOO_DB, UID, ODOO_API_KEY, model, method, args, kwargs]
-    },
-    id: Date.now()
-  };
-  const res = await axios.post(`${ODOO_URL}/jsonrpc`, body,
-    { headers: { "Content-Type": "application/json" }});
-  if (res.data.error) throw new Error(res.data.error.data.message);
-  return res.data.result;
-}
+// Inicializar tablas cuando se inicia el servidor
+crearTablas();
+
+const PORT = process.env.PORT || 3001;
 
 /* --------- RUTAS --------- */
 
 // ping (prueba rápida)
 app.get("/api/ping", (_, res) => res.json({ ok: true }));
 
-// Listar clientes (solo los que son clientes)
+// ===================== CLIENTES =====================
 app.get("/api/clientes", async (req, res) => {
   try {
-    const result = await odooExecute(
-      "res.partner", "search_read",
-      [[["customer_rank", ">", 0]]],
-      { fields: ["id","name","email","phone"], limit: 50 }
-    );
-    res.json(result);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { q } = req.query;
+    
+    let query = `SELECT * FROM clientes WHERE activo = true`;
+    let params = [];
+
+    if (q) {
+      query += ` AND (name ILIKE $1 OR email ILIKE $1 OR vat ILIKE $1)`;
+      params.push(`%${q}%`);
+    }
+
+    query += ` ORDER BY name`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (e) {
+    console.error("ERROR /api/clientes:", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// Crear cliente
-// Crear cliente (marca como cliente con customer_rank=1)
 app.post("/api/clientes", async (req, res) => {
   try {
-    const { name, email, phone, vat } = req.body || {};
+    const { name, email, phone, vat, street, city } = req.body;
+    
     if (!name) return res.status(400).json({ error: "Falta 'name'" });
 
-    const id = await odooExecute("res.partner", "create", [{
-      name,
-      email: email || null,
-      phone: phone || null,
-      vat:   vat   || null,   // RUC/DNI si quieres guardarlo
-      customer_rank: 1,       // << clave para que aparezca en "Clientes"
-      company_type: "person", // opcional
-    }]);
-
-    res.json({ id });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-
-// Ventas: resumen por rango (suma en Odoo vía read_group)
-// Ventas: resumen por rango (sumando en Node para evitar issues con read_group en monetarios)
-app.get("/api/ventas/resumen", async (req, res) => {
-  try {
-    const { desde, hasta } = req.query; // YYYY-MM-DD
-    if (!desde || !hasta) {
-      return res.status(400).json({ error: "Faltan 'desde' y 'hasta' (YYYY-MM-DD)" });
-    }
-
-    const domain = [
-      ["date_order", ">=", String(desde)],
-      ["date_order", "<",  String(hasta)],
-      ["state", "in", ["sale", "done"]],
-    ];
-
-    // 1) Buscar IDs sin límite
-    const ids = await odooExecute("sale.order", "search", [domain], { limit: 0 });
-
-    // 2) Leer montos (y datos útiles por si quieres depurar)
-    const orders = ids.length
-      ? await odooExecute("sale.order", "read", [ids, ["amount_total", "state", "date_order", "currency_id"]])
-      : [];
-
-    // 3) Sumar total y contar
-    const total = orders.reduce((s, o) => s + (o.amount_total || 0), 0);
-    const cantidad = orders.length;
-
-    res.json({ total, cantidad, desde, hasta });
-  } catch (e) {
-    console.error("ERROR /api/ventas/resumen:", e?.response?.data || e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Ventas por mes en un rango de meses (YYYY-MM a YYYY-MM, inclusive)
-app.get("/api/ventas/meses", async (req, res) => {
-  try {
-    const { desde, hasta } = req.query; // formato 'YYYY-MM'
-    if (!desde || !hasta) {
-      return res.status(400).json({ error: "Faltan 'desde' y 'hasta' en formato YYYY-MM" });
-    }
-
-    // Parseo simple YYYY-MM
-    const [y1, m1] = desde.split("-").map(Number);
-    const [y2, m2] = hasta.split("-").map(Number);
-    if (!y1 || !m1 || !y2 || !m2) {
-      return res.status(400).json({ error: "Formato inválido. Usa YYYY-MM" });
-    }
-
-    // Limitar a 36 meses para evitar abusos
-    const periodos = [];
-    let y = y1, m = m1; // m = 1..12
-    let guard = 0;
-
-    function ymStr(yy, mm) { return `${yy}-${String(mm).padStart(2,"0")}`; }
-    function firstDay(yy, mm) { return `${ymStr(yy, mm)}-01`; }
-    function nextMonth(yy, mm) {
-      const ny = mm === 12 ? yy + 1 : yy;
-      const nm = mm === 12 ? 1 : mm + 1;
-      return [ny, nm];
-    }
-
-    // Itera desde y1-m1 hasta y2-m2 inclusive
-    while ((y < y2) || (y === y2 && m <= m2)) {
-      const desdeDia = firstDay(y, m);
-      const [ny, nm] = nextMonth(y, m);
-      const hastaDia = firstDay(ny, nm);
-
-      // Re-uso de la lógica de suma segura (search + read)
-      const domain = [
-        ["date_order", ">=", desdeDia],
-        ["date_order", "<",  hastaDia],
-        ["state", "in", ["sale","done"]],
-      ];
-      const ids = await odooExecute("sale.order", "search", [domain], { limit: 0 });
-      const orders = ids.length
-        ? await odooExecute("sale.order", "read", [ids, ["amount_total"]])
-        : [];
-      const total = orders.reduce((s,o)=> s + (o.amount_total || 0), 0);
-      const cantidad = orders.length;
-
-      periodos.push({ mes: ymStr(y, m), total, cantidad });
-
-      [y, m] = nextMonth(y, m);
-      if (++guard > 40) break; // safety
-    }
-
-    res.json({ periodos });
-  } catch (e) {
-    console.error("ERROR /api/ventas/meses:", e?.response?.data || e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ===================== PRODUCTOS =====================
-
-// Listar productos (templates)
-app.get("/api/productos", async (req, res) => {
-  try {
-    const { q } = req.query;
-    const domain = q
-      ? [["|", ["name", "ilike", String(q)], ["default_code", "ilike", String(q)]]]
-      : [["active", "=", true]];
-    const items = await odooExecute(
-      "product.template", "search_read",
-      [domain],
-      { fields: ["id","name","default_code","list_price","barcode","tracking","product_variant_id","type"], limit: 100 }
+    const result = await pool.query(
+      `INSERT INTO clientes (name, email, phone, vat, street, city) 
+       VALUES ($1, $2, $3, $4, $5, $6) 
+       RETURNING id`,
+      [name, email, phone, vat, street, city]
     );
-    const mapped = items.map(p => ({
-      ...p,
-      variant_id: Array.isArray(p.product_variant_id) ? p.product_variant_id[0] : null,
-      variant_name: Array.isArray(p.product_variant_id) ? p.product_variant_id[1] : null,
-    }));
-    res.json(mapped);
+
+    res.json({ id: result.rows[0].id });
   } catch (e) {
-    console.error("ERROR /api/productos:", e?.response?.data || e.message);
+    console.error("ERROR POST /api/clientes:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// Crear producto
-app.post("/api/productos", async (req, res) => {
+// ===================== EMPLEADOS =====================
+app.get("/api/empleados", async (req, res) => {
   try {
-    const { name, sku, price, barcode, tracking = "none" } = req.body || {};
+    const { q, incluir_eliminados } = req.query;
+    
+    let query = `
+      SELECT e.*, p.name as job_name 
+      FROM empleados e 
+      LEFT JOIN puestos p ON e.job_id = p.id 
+      WHERE 1=1
+    `;
+    let params = [];
+    let paramCount = 0;
+
+    if (!incluir_eliminados || incluir_eliminados === 'false') {
+      query += ` AND e.activo = true`;
+    }
+
+    if (q) {
+      paramCount++;
+      query += ` AND (e.name ILIKE $${paramCount} OR e.work_email ILIKE $${paramCount} OR e.identification_id ILIKE $${paramCount})`;
+      params.push(`%${q}%`);
+    }
+
+    query += ` ORDER BY e.name`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (e) {
+    console.error("ERROR /api/empleados:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// CREAR EMPLEADO
+app.post("/api/empleados", async (req, res) => {
+  try {
+    const {
+      name,
+      work_email,
+      work_phone,
+      job_id,
+      identification_id,
+      fecha_ingreso,
+      salario
+    } = req.body;
+
     if (!name) return res.status(400).json({ error: "Falta 'name'" });
-    const templateId = await odooExecute("product.template", "create", [{
-      name,
-      default_code: sku || null,
-      list_price: typeof price === "number" ? price : 0,
-      barcode: barcode || null,
-      tracking,        // "none" | "lot" | "serial"
-      type: "product", // almacenable
-      sale_ok: true,
-      purchase_ok: true,
-    }]);
-    const [tpl] = await odooExecute("product.template", "read", [[templateId], ["product_variant_id"]]);
-    const variant_id = Array.isArray(tpl.product_variant_id) ? tpl.product_variant_id[0] : null;
-    res.json({ template_id: templateId, variant_id });
-  } catch (e) {
-    console.error("ERROR POST /api/productos:", e?.response?.data || e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
 
-// Crear series para una variante
-app.post("/api/productos/:variantId/seriales", async (req, res) => {
-  try {
-    const variantId = parseInt(req.params.variantId, 10);
-    const { serials } = req.body || {};
-    if (!variantId) return res.status(400).json({ error: "variantId inválido" });
-    if (!Array.isArray(serials) || serials.length === 0)
-      return res.status(400).json({ error: "Debe enviar 'serials' como array" });
-
-    const created = [];
-    for (const s of serials) {
-      const lotId = await odooExecute("stock.production.lot", "create", [{
-        name: String(s),
-        product_id: variantId,
-      }]);
-      created.push(lotId);
-    }
-    res.json({ created });
-  } catch (e) {
-    console.error("ERROR POST /api/productos/:variantId/seriales:", e?.response?.data || e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ===================== INVENTARIO =====================
-app.get("/api/inventario", async (req, res) => {
-  try {
-    const { variant_id } = req.query;
-    const domain = [["location_id.usage","=","internal"]];
-    if (variant_id) domain.push(["product_id","=", Number(variant_id)]);
-
-    const quants = await odooExecute(
-      "stock.quant", "search_read",
-      [domain],
-      { fields: ["product_id","location_id","quantity","reserved_quantity"], limit: 200 }
+    const result = await pool.query(
+      `INSERT INTO empleados (name, work_email, work_phone, job_id, identification_id, fecha_ingreso, salario)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id`,
+      [name, work_email, work_phone, job_id, identification_id, fecha_ingreso, salario]
     );
 
-    const totales = {};
-    for (const q of quants) {
-      const pid = Array.isArray(q.product_id) ? q.product_id[0] : q.product_id;
-      if (!totales[pid]) totales[pid] = { product_id: pid, quantity: 0, reserved: 0, available: 0, by_location: [] };
-      totales[pid].quantity += q.quantity || 0;
-      totales[pid].reserved += q.reserved_quantity || 0;
-      totales[pid].by_location.push({
-        location: Array.isArray(q.location_id) ? q.location_id[1] : String(q.location_id),
-        quantity: q.quantity || 0,
-        reserved: q.reserved_quantity || 0,
-      });
-    }
-    for (const pid of Object.keys(totales)) {
-      totales[pid].available = totales[pid].quantity - totales[pid].reserved;
-    }
-    res.json({ quants, totales: Object.values(totales) });
+    res.json({ 
+      id: result.rows[0].id,
+      message: "Empleado creado correctamente"
+    });
   } catch (e) {
-    console.error("ERROR /api/inventario:", e?.response?.data || e.message);
+    console.error("ERROR POST /api/empleados:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ACTUALIZAR EMPLEADO
+app.put("/api/empleados/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      name,
+      work_email,
+      work_phone,
+      job_id,
+      identification_id,
+      fecha_ingreso,
+      salario
+    } = req.body;
+
+    const existe = await pool.query('SELECT id FROM empleados WHERE id = $1', [id]);
+    if (existe.rows.length === 0) {
+      return res.status(404).json({ error: "Empleado no encontrado" });
+    }
+
+    await pool.query(
+      `UPDATE empleados 
+       SET name = $1, work_email = $2, work_phone = $3, job_id = $4, 
+           identification_id = $5, fecha_ingreso = $6, salario = $7,
+           updated_at = NOW()
+       WHERE id = $8`,
+      [name, work_email, work_phone, job_id, identification_id, fecha_ingreso, salario, id]
+    );
+
+    res.json({ message: "Empleado actualizado correctamente" });
+  } catch (e) {
+    console.error("ERROR PUT /api/empleados:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ELIMINAR EMPLEADO
+app.delete("/api/empleados/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const existe = await pool.query('SELECT id FROM empleados WHERE id = $1', [id]);
+    if (existe.rows.length === 0) {
+      return res.status(404).json({ error: "Empleado no encontrado" });
+    }
+
+    await pool.query(
+      'UPDATE empleados SET activo = false, updated_at = NOW() WHERE id = $1',
+      [id]
+    );
+
+    res.json({ message: "Empleado eliminado correctamente" });
+  } catch (e) {
+    console.error("ERROR DELETE /api/empleados:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// RECUPERAR EMPLEADO
+app.put("/api/empleados/:id/recuperar", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    await pool.query(
+      'UPDATE empleados SET activo = true, updated_at = NOW() WHERE id = $1',
+      [id]
+    );
+
+    res.json({ message: "Empleado recuperado correctamente" });
+  } catch (e) {
+    console.error("ERROR recuperar empleado:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== PUESTOS =====================
+app.get("/api/puestos", async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM puestos ORDER BY name');
+    res.json(result.rows);
+  } catch (e) {
+    console.error("ERROR /api/puestos:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/puestos", async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ error: "Falta 'name'" });
+
+    const result = await pool.query(
+      'INSERT INTO puestos (name) VALUES ($1) RETURNING id',
+      [name]
+    );
+
+    res.json({ id: result.rows[0].id });
+  } catch (e) {
+    console.error("ERROR POST /api/puestos:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
 // ===================== PROVEEDORES =====================
-// Listar proveedores (partners con supplier_rank > 0). Soporta búsqueda ?q=
 app.get("/api/proveedores", async (req, res) => {
   try {
     const { q } = req.query;
+    
+    let query = `SELECT * FROM proveedores WHERE activo = true`;
+    let params = [];
 
-    // Siempre filtramos por proveedores
-    const domain = [
-      ["supplier_rank", ">", 0],
-      ["active", "=", true],
-    ];
-
-    // Búsqueda opcional por nombre, RUC (vat), email o teléfono
     if (q) {
-      domain.push("|", "|", "|",
-        ["name",  "ilike", String(q)],
-        ["vat",   "ilike", String(q)],
-        ["email", "ilike", String(q)],
-        ["phone", "ilike", String(q)]
-      );
+      query += ` AND (name ILIKE $1 OR email ILIKE $1 OR vat ILIKE $1)`;
+      params.push(`%${q}%`);
     }
 
-    const items = await odooExecute(
-      "res.partner",
-      "search_read",
-      [domain],
-      { fields: ["id","name","vat","email","phone","supplier_rank"], limit: 100 }
-    );
+    query += ` ORDER BY name`;
 
-    res.json(items);
+    const result = await pool.query(query, params);
+    res.json(result.rows);
   } catch (e) {
-    console.error("ERROR /api/proveedores:", e?.response?.data || e.message);
-    res.status(500).json({ error: e.message, raw: e?.response?.data });
+    console.error("ERROR /api/proveedores:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
-// Crear proveedor (marca supplier_rank=1)
 app.post("/api/proveedores", async (req, res) => {
   try {
-    const { name, email, phone, vat } = req.body || {};
+    const { name, email, phone, vat } = req.body;
+    
     if (!name) return res.status(400).json({ error: "Falta 'name'" });
 
-    const id = await odooExecute("res.partner", "create", [{
-      name,
-      email: email || null,
-      phone: phone || null,
-      vat:   vat   || null,   // RUC en Perú
-      supplier_rank: 1,
-      company_type: "company", // opcional: tratarlos como empresa
-    }]);
+    const result = await pool.query(
+      `INSERT INTO proveedores (name, email, phone, vat) 
+       VALUES ($1, $2, $3, $4) 
+       RETURNING id`,
+      [name, email, phone, vat]
+    );
 
-    res.json({ id });
+    res.json({ id: result.rows[0].id });
   } catch (e) {
-    console.error("ERROR POST /api/proveedores:", e?.response?.data || e.message);
-    res.status(500).json({ error: e.message, raw: e?.response?.data });
+    console.error("ERROR POST /api/proveedores:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== PRODUCTOS =====================
+app.get("/api/productos", async (req, res) => {
+  try {
+    const { q } = req.query;
+    
+    let query = `SELECT * FROM productos WHERE activo = true`;
+    let params = [];
+
+    if (q) {
+      query += ` AND (name ILIKE $1 OR sku ILIKE $1 OR barcode ILIKE $1)`;
+      params.push(`%${q}%`);
+    }
+
+    query += ` ORDER BY name`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (e) {
+    console.error("ERROR /api/productos:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/productos", async (req, res) => {
+  try {
+    const { name, sku, price, cost, barcode } = req.body;
+    
+    if (!name) return res.status(400).json({ error: "Falta 'name'" });
+
+    const result = await pool.query(
+      `INSERT INTO productos (name, sku, price, cost, barcode) 
+       VALUES ($1, $2, $3, $4, $5) 
+       RETURNING id`,
+      [name, sku, price, cost, barcode]
+    );
+
+    res.json({ id: result.rows[0].id });
+  } catch (e) {
+    console.error("ERROR POST /api/productos:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== VENTAS =====================
+app.get("/api/ventas/resumen", async (req, res) => {
+  try {
+    const { desde, hasta } = req.query;
+    
+    if (!desde || !hasta) {
+      return res.status(400).json({ error: "Faltan 'desde' y 'hasta' (YYYY-MM-DD)" });
+    }
+
+    const result = await pool.query(
+      `SELECT COUNT(*) as cantidad, COALESCE(SUM(amount_total), 0) as total
+       FROM ventas 
+       WHERE date_order >= $1 AND date_order <= $2 AND state = 'done'`,
+      [desde, hasta]
+    );
+
+    const { cantidad, total } = result.rows[0];
+    
+    res.json({ 
+      total: parseFloat(total),
+      cantidad: parseInt(cantidad),
+      desde, 
+      hasta 
+    });
+  } catch (e) {
+    console.error("ERROR /api/ventas/resumen:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
 
-app.listen(PORT, () => console.log(`API lista en http://localhost:${PORT}`));
+
+// ===================== MARCAS =====================
+
+// LISTAR MARCAS
+app.get("/api/marcas", async (req, res) => {
+  try {
+    const { q } = req.query;
+    
+    let query = `SELECT * FROM marcas WHERE activo = true`;
+    let params = [];
+
+    if (q) {
+      query += ` AND name ILIKE $1`;
+      params.push(`%${q}%`);
+    }
+
+    query += ` ORDER BY name`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (e) {
+    console.error("ERROR /api/marcas:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// CREAR MARCA
+app.post("/api/marcas", async (req, res) => {
+  try {
+    const { name, descripcion } = req.body;
+    
+    if (!name) return res.status(400).json({ error: "Falta 'name'" });
+
+    const result = await pool.query(
+      `INSERT INTO marcas (name, descripcion) 
+       VALUES ($1, $2) 
+       RETURNING id, name, descripcion`,
+      [name, descripcion]
+    );
+
+    res.json({ 
+      id: result.rows[0].id,
+      message: "Marca creada correctamente",
+      marca: result.rows[0]
+    });
+  } catch (e) {
+    console.error("ERROR POST /api/marcas:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== MODELOS =====================
+
+// LISTAR MODELOS (con información de marca)
+app.get("/api/modelos", async (req, res) => {
+  try {
+    const { q, marca_id } = req.query;
+    
+    let query = `
+      SELECT m.*, ma.name as marca_name 
+      FROM modelos m 
+      LEFT JOIN marcas ma ON m.marca_id = ma.id 
+      WHERE m.activo = true
+    `;
+    let params = [];
+    let paramCount = 0;
+
+    if (marca_id) {
+      paramCount++;
+      query += ` AND m.marca_id = $${paramCount}`;
+      params.push(marca_id);
+    }
+
+    if (q) {
+      paramCount++;
+      query += ` AND m.name ILIKE $${paramCount}`;
+      params.push(`%${q}%`);
+    }
+
+    query += ` ORDER BY ma.name, m.name`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (e) {
+    console.error("ERROR /api/modelos:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// CREAR MODELO
+app.post("/api/modelos", async (req, res) => {
+  try {
+    const { name, marca_id, descripcion } = req.body;
+    
+    if (!name) return res.status(400).json({ error: "Falta 'name'" });
+    if (!marca_id) return res.status(400).json({ error: "Falta 'marca_id'" });
+
+    // Verificar que la marca existe
+    const marcaExiste = await pool.query('SELECT id FROM marcas WHERE id = $1 AND activo = true', [marca_id]);
+    if (marcaExiste.rows.length === 0) {
+      return res.status(404).json({ error: "Marca no encontrada" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO modelos (name, marca_id, descripcion) 
+       VALUES ($1, $2, $3) 
+       RETURNING id, name, marca_id, descripcion`,
+      [name, marca_id, descripcion]
+    );
+
+    res.json({ 
+      id: result.rows[0].id,
+      message: "Modelo creado correctamente",
+      modelo: result.rows[0]
+    });
+  } catch (e) {
+    console.error("ERROR POST /api/modelos:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== PEDIDOS PROVEEDOR =====================
+
+// MODIFICAR: GET /api/pedidos-proveedor (agregar total calculado y count productos)
+app.get("/api/pedidos-proveedor", async (req, res) => {
+  try {
+    const { proveedor_id } = req.query;
+    
+    let query = `
+      SELECT 
+        pp.*, 
+        p.name as proveedor_name,
+        COALESCE(SUM(pd.costo), 0) as total,  -- 👈 Total calculado en tiempo real (de productos activos)
+        COUNT(pd.id) FILTER (WHERE pd.estado != 'eliminado') as productos_count  -- 👈 Solo activos
+      FROM pedidos_proveedor pp 
+      LEFT JOIN proveedores p ON pp.proveedor_id = p.id
+      LEFT JOIN productos_detallados pd ON pp.id = pd.pedido_id
+      WHERE 1=1
+    `;
+    let params = [];
+    if (proveedor_id) {
+      query += ` AND pp.proveedor_id = $1`;
+      params.push(proveedor_id);
+    }
+    query += ` GROUP BY pp.id, p.name ORDER BY pp.fecha_pedido DESC`;
+    const result = await pool.query(query, params);
+    res.json(result.rows);  // Ahora trae total y productos_count actualizados
+  } catch (e) {
+    console.error("ERROR /api/pedidos-proveedor:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// CREAR PEDIDO
+app.post("/api/pedidos-proveedor", async (req, res) => {
+  try {
+    const { proveedor_id, numero_pedido, fecha_pedido, fecha_entrega, observaciones } = req.body;
+    
+    if (!proveedor_id || !numero_pedido || !fecha_pedido) {
+      return res.status(400).json({ error: "Faltan campos obligatorios" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO pedidos_proveedor (proveedor_id, numero_pedido, fecha_pedido, fecha_entrega, observaciones) 
+       VALUES ($1, $2, $3, $4, $5) 
+       RETURNING id, numero_pedido, fecha_pedido, estado`,
+      [proveedor_id, numero_pedido, fecha_pedido, fecha_entrega, observaciones]
+    );
+
+    res.json({ 
+      id: result.rows[0].id,
+      message: "Pedido creado correctamente"
+    });
+  } catch (e) {
+    console.error("ERROR POST /api/pedidos-proveedor:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== PRODUCTOS DETALLADOS =====================
+
+// LISTAR PRODUCTOS POR PEDIDO
+app.get("/api/productos-detallados", async (req, res) => {
+  try {
+    const { pedido_id } = req.query;
+    
+    if (!pedido_id) {
+      return res.status(400).json({ error: "Falta pedido_id" });
+    }
+
+    const result = await pool.query(
+      `SELECT pd.*, m.name as modelo_name, ma.name as marca_name 
+       FROM productos_detallados pd 
+       LEFT JOIN modelos m ON pd.modelo_id = m.id 
+       LEFT JOIN marcas ma ON m.marca_id = ma.id 
+       WHERE pd.pedido_id = $1 
+       ORDER BY pd.created_at DESC`,
+      [pedido_id]
+    );
+
+    res.json(result.rows);
+  } catch (e) {
+    console.error("ERROR /api/productos-detallados:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== PRODUCTOS DETALLADOS =====================
+app.post("/api/productos-detallados", async (req, res) => {
+  try {
+    const { pedido_id, modelo_id, imei_1, imei_2, costo, fecha_ingreso } = req.body;
+    
+    if (!pedido_id || !modelo_id || !imei_1 || !costo || !fecha_ingreso) {
+      return res.status(400).json({ error: "Faltan campos obligatorios" });
+    }
+
+    // Verificar que el pedido existe
+    const pedidoExiste = await pool.query('SELECT id FROM pedidos_proveedor WHERE id = $1', [pedido_id]);
+    if (pedidoExiste.rows.length === 0) {
+      return res.status(404).json({ error: "Pedido no encontrado" });
+    }
+
+    // 👈 NUEVO: Verificar que el modelo existe y está activo
+    const modeloExiste = await pool.query('SELECT id FROM modelos WHERE id = $1 AND activo = true', [modelo_id]);
+    if (modeloExiste.rows.length === 0) {
+      return res.status(404).json({ error: "Modelo no encontrado o inactivo" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO productos_detallados (pedido_id, modelo_id, imei_1, imei_2, costo, fecha_ingreso, estado) 
+       VALUES ($1, $2, $3, $4, $5, $6, 'en_stock')  -- Estado por defecto 'en_stock'
+       RETURNING id, imei_1, costo, fecha_ingreso`,
+      [pedido_id, modelo_id, imei_1, imei_2, costo, fecha_ingreso]
+    );
+
+    const nuevoId = result.rows[0].id;
+
+    // 👈 CRÍTICO: Recalcular total del pedido después del insert
+    await recalcularTotalPedido(pedido_id);
+
+    console.log(`✅ Producto agregado: ID ${nuevoId}, Pedido ${pedido_id}, Costo S/ ${costo}`);  // DEBUG
+
+    res.json({ 
+      id: nuevoId,
+      message: "Producto agregado correctamente"
+    });
+  } catch (e) {
+    console.error("❌ ERROR POST /api/productos-detallados:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// ===================== ACTUALIZAR TOTAL DE PEDIDO =====================
+async function recalcularTotalPedido(pedidoId) {
+  try {
+    // Sumar costos de productos activos del pedido
+    const totalResult = await pool.query(
+      `SELECT COALESCE(SUM(costo), 0) as total 
+       FROM productos_detallados 
+       WHERE pedido_id = $1 AND estado = 'en_stock'`,  // Solo en_stock
+      [pedidoId]
+    );
+    
+    const total = parseFloat(totalResult.rows[0].total);
+
+    // Actualizar pedido
+    await pool.query(
+      `UPDATE pedidos_proveedor 
+       SET total = $1, updated_at = NOW()
+       WHERE id = $2`,
+      [total, pedidoId]
+    );
+    
+    console.log(`💰 Total recalculado para pedido ${pedidoId}: S/ ${total.toFixed(2)} (productos en stock)`);
+    return total;
+  } catch (error) {
+    console.error("❌ Error recalculando total de pedido:", error);
+    throw error;
+  }
+}
+
+
+// ===================== INVENTARIO AUTOMÁTICO =====================
+
+// ===================== INVENTARIO AUTOMÁTICO ===================== (NUEVA QUERY DESDE productos_detallados)
+app.get("/api/inventario", async (req, res) => {
+  try {
+    const { q } = req.query;  // Filtro opcional por búsqueda (marca/modelo/proveedor)
+
+    let query = `
+      SELECT 
+        ma.name as marca,
+        m.name as modelo,
+        COUNT(pd.id) as stock,
+        MAX(pd.fecha_ingreso) as ultima_entrada,
+        ARRAY_AGG(DISTINCT pr.name) FILTER (WHERE pr.name IS NOT NULL) as proveedores
+      FROM productos_detallados pd
+      INNER JOIN modelos m ON pd.modelo_id = m.id
+      INNER JOIN marcas ma ON m.marca_id = ma.id
+      LEFT JOIN pedidos_proveedor pp ON pd.pedido_id = pp.id
+      LEFT JOIN proveedores pr ON pp.proveedor_id = pr.id
+      WHERE pd.estado = 'en_stock'  -- Solo productos disponibles (ajusta si usas otros estados)
+    `;
+    let params = [];
+
+    // Filtro de búsqueda
+    if (q) {
+      query += ` AND (
+        LOWER(ma.name) LIKE $${params.length + 1} OR 
+        LOWER(m.name) LIKE $${params.length + 1} OR 
+        LOWER(pr.name) LIKE $${params.length + 1}
+      )`;
+      params.push(`%${q}%`);
+    }
+
+    query += `
+      GROUP BY ma.id, ma.name, m.id, m.name
+      HAVING COUNT(pd.id) > 0  -- Solo modelos con stock > 0
+      ORDER BY ma.name, m.name
+    `;
+
+    console.log('🔍 Query inventario ejecutada:', query, params);  // DEBUG: Mira logs al llamar
+
+    const result = await pool.query(query, params);
+    console.log('📦 Inventario devuelto:', result.rows.length, 'modelos');  // DEBUG: Confirma count
+
+    res.json(result.rows);  // 👈 Array simple: [{marca, modelo, stock, ultima_entrada, proveedores: []}]
+  } catch (e) {
+    console.error("❌ ERROR /api/inventario:", e);
+    res.status(500).json({ error: 'Error al obtener inventario', details: e.message });
+  }
+});
+
+
+// NUEVA: PUT /api/productos-detallados/:id (para editar producto, ej: cambiar costo)
+app.put("/api/productos-detallados/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { imei_1, imei_2, costo, fecha_ingreso, estado } = req.body;
+    // Verificar producto existe
+    const productoExiste = await pool.query('SELECT id, pedido_id FROM productos_detallados WHERE id = $1', [id]);
+    if (productoExiste.rows.length === 0) {
+      return res.status(404).json({ error: "Producto no encontrado" });
+    }
+    const pedidoId = productoExiste.rows[0].pedido_id;
+    // Actualizar (solo campos proporcionados, pero para simplicidad actualizamos todos)
+    await pool.query(
+      `UPDATE productos_detallados 
+       SET imei_1 = $1, imei_2 = $2, costo = $3, fecha_ingreso = $4, estado = COALESCE($5, estado)
+       WHERE id = $6`,
+      [imei_1, imei_2, costo, fecha_ingreso, estado, id]
+    );
+    // 👈 Recalcular total (si cambió costo o estado a 'eliminado')
+    await recalcularTotalPedido(pedidoId);
+    res.json({ message: "Producto actualizado correctamente" });
+  } catch (e) {
+    console.error("ERROR PUT /api/productos-detallados:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// NUEVA: GET /api/ventas/meses (para comparador en Ventas.tsx)
+app.get("/api/ventas/meses", async (req, res) => {
+  try {
+    const { desde, hasta } = req.query;  // YYYY-MM formato
+    
+    if (!desde || !hasta) {
+      return res.status(400).json({ error: "Faltan 'desde' y 'hasta' (YYYY-MM)" });
+    }
+    const result = await pool.query(
+      `SELECT 
+         TO_CHAR(date_order, 'YYYY-MM') as mes,
+         COUNT(*) as cantidad,
+         COALESCE(SUM(amount_total), 0) as total
+       FROM ventas 
+       WHERE TO_CHAR(date_order, 'YYYY-MM') >= $1 
+         AND TO_CHAR(date_order, 'YYYY-MM') <= $2 
+         AND state = 'done'
+       GROUP BY TO_CHAR(date_order, 'YYYY-MM')
+       ORDER BY mes`,
+      [desde, hasta]
+    );
+    res.json({ 
+      periodos: result.rows.map(row => ({
+        mes: row.mes,
+        total: parseFloat(row.total),
+        cantidad: parseInt(row.cantidad)
+      }))
+    });
+  } catch (e) {
+    console.error("ERROR /api/ventas/meses:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Opcional: Agregar columna updated_at a pedidos_proveedor si no existe (ejecuta una vez en DB)
+async function agregarUpdatedAtPedidos() {
+  try {
+    await pool.query(`
+      ALTER TABLE pedidos_proveedor 
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()
+    `);
+    console.log("✅ Columna updated_at agregada a pedidos_proveedor");
+  } catch (e) {
+    console.error("Error agregando updated_at:", e);
+  }
+}
+// Llama a la función al inicio (después de crearTablas)
+agregarUpdatedAtPedidos();
+
+
+app.listen(PORT, () => {
+  console.log(`🚀 API PostgreSQL lista en http://localhost:${PORT}`);
+  console.log(`📊 Base de datos: PostgreSQL`);
+});
+
