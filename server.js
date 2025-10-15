@@ -500,6 +500,8 @@ app.post("/api/productos", async (req, res) => {
   }
 });
 
+
+
 // ===================== VENTAS =====================
 app.get("/api/ventas/resumen", async (req, res) => {
   try {
@@ -814,26 +816,30 @@ async function recalcularTotalPedido(pedidoId) {
 }
 
 
-// ===================== INVENTARIO AUTOMÁTICO =====================
-
-// ===================== INVENTARIO AUTOMÁTICO ===================== (NUEVA QUERY DESDE productos_detallados)
+// ===================== INVENTARIO JERÁRQUICO =====================
 app.get("/api/inventario", async (req, res) => {
   try {
-    const { q } = req.query;  // Filtro opcional por búsqueda (marca/modelo/proveedor)
+    const { q } = req.query;  // Filtro opcional por búsqueda
 
     let query = `
       SELECT 
+        ma.id as marca_id,
         ma.name as marca,
+        m.id as modelo_id,
         m.name as modelo,
-        COUNT(pd.id) as stock,
-        MAX(pd.fecha_ingreso) as ultima_entrada,
-        ARRAY_AGG(DISTINCT pr.name) FILTER (WHERE pr.name IS NOT NULL) as proveedores
+        pd.id as producto_id,
+        pd.imei_1,
+        pd.imei_2,
+        pd.costo,
+        pd.fecha_ingreso,
+        pd.estado,
+        pr.name as proveedor
       FROM productos_detallados pd
       INNER JOIN modelos m ON pd.modelo_id = m.id
       INNER JOIN marcas ma ON m.marca_id = ma.id
       LEFT JOIN pedidos_proveedor pp ON pd.pedido_id = pp.id
       LEFT JOIN proveedores pr ON pp.proveedor_id = pr.id
-      WHERE pd.estado = 'en_stock'  -- Solo productos disponibles (ajusta si usas otros estados)
+      WHERE pd.estado = 'en_stock'
     `;
     let params = [];
 
@@ -842,29 +848,69 @@ app.get("/api/inventario", async (req, res) => {
       query += ` AND (
         LOWER(ma.name) LIKE $${params.length + 1} OR 
         LOWER(m.name) LIKE $${params.length + 1} OR 
+        LOWER(pd.imei_1) LIKE $${params.length + 1} OR
         LOWER(pr.name) LIKE $${params.length + 1}
       )`;
-      params.push(`%${q}%`);
+      params.push(`%${q.toLowerCase()}%`);
     }
 
-    query += `
-      GROUP BY ma.id, ma.name, m.id, m.name
-      HAVING COUNT(pd.id) > 0  -- Solo modelos con stock > 0
-      ORDER BY ma.name, m.name
-    `;
-
-    console.log('🔍 Query inventario ejecutada:', query, params);  // DEBUG: Mira logs al llamar
+    query += ` ORDER BY ma.name, m.name, pd.fecha_ingreso DESC`;
 
     const result = await pool.query(query, params);
-    console.log('📦 Inventario devuelto:', result.rows.length, 'modelos');  // DEBUG: Confirma count
+    
+    // Agrupar por marca > modelo > unidades
+    const inventarioJerarquico = {};
+    
+    result.rows.forEach(row => {
+      const marcaKey = row.marca_id;
+      
+      if (!inventarioJerarquico[marcaKey]) {
+        inventarioJerarquico[marcaKey] = {
+          marca_id: row.marca_id,
+          marca: row.marca,
+          stock_total: 0,
+          modelos: {}
+        };
+      }
+      
+      const modeloKey = row.modelo_id;
+      
+      if (!inventarioJerarquico[marcaKey].modelos[modeloKey]) {
+        inventarioJerarquico[marcaKey].modelos[modeloKey] = {
+          modelo_id: row.modelo_id,
+          modelo: row.modelo,
+          stock: 0,
+          unidades: []
+        };
+      }
+      
+      inventarioJerarquico[marcaKey].modelos[modeloKey].unidades.push({
+        producto_id: row.producto_id,
+        imei_1: row.imei_1,
+        imei_2: row.imei_2,
+        costo: parseFloat(row.costo),
+        fecha_ingreso: row.fecha_ingreso,
+        proveedor: row.proveedor,
+        estado: row.estado
+      });
+      
+      inventarioJerarquico[marcaKey].modelos[modeloKey].stock++;
+      inventarioJerarquico[marcaKey].stock_total++;
+    });
+    
+    // Convertir objetos a arrays
+    const inventarioFinal = Object.values(inventarioJerarquico).map(marca => ({
+      ...marca,
+      modelos: Object.values(marca.modelos)
+    }));
 
-    res.json(result.rows);  // 👈 Array simple: [{marca, modelo, stock, ultima_entrada, proveedores: []}]
+    console.log(`📦 Inventario jerárquico: ${inventarioFinal.length} marcas`);
+    res.json(inventarioFinal);
   } catch (e) {
     console.error("❌ ERROR /api/inventario:", e);
     res.status(500).json({ error: 'Error al obtener inventario', details: e.message });
   }
 });
-
 
 // NUEVA: PUT /api/productos-detallados/:id (para editar producto, ej: cambiar costo)
 app.put("/api/productos-detallados/:id", async (req, res) => {
@@ -939,6 +985,221 @@ async function agregarUpdatedAtPedidos() {
     console.error("Error agregando updated_at:", e);
   }
 }
+
+// ===================== VENTAS DETALLADAS =====================
+
+// Crear tabla ventas_detalle si no existe
+async function crearTablaVentasDetalle() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ventas_detalle (
+        id SERIAL PRIMARY KEY,
+        venta_id INTEGER REFERENCES ventas(id) ON DELETE CASCADE,
+        producto_detallado_id INTEGER REFERENCES productos_detallados(id),
+        precio_venta DECIMAL(10,2) NOT NULL,
+        costo DECIMAL(10,2) NOT NULL,
+        margen DECIMAL(10,2) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log("✅ Tabla ventas_detalle verificada");
+  } catch (e) {
+    console.error("Error creando ventas_detalle:", e);
+  }
+}
+crearTablaVentasDetalle();
+
+// LISTAR VENTAS (con detalles de productos)
+app.get("/api/ventas", async (req, res) => {
+  try {
+    const { desde, hasta, cliente_id } = req.query;
+    
+    let query = `
+      SELECT 
+        v.*,
+        c.name as cliente_name,
+        COUNT(vd.id) as productos_count,
+        COALESCE(SUM(vd.precio_venta), 0) as total_real
+      FROM ventas v
+      LEFT JOIN clientes c ON v.cliente_id = c.id
+      LEFT JOIN ventas_detalle vd ON v.id = vd.venta_id
+      WHERE 1=1
+    `;
+    let params = [];
+    let paramCount = 0;
+
+    if (desde) {
+      paramCount++;
+      query += ` AND v.date_order >= $${paramCount}`;
+      params.push(desde);
+    }
+    if (hasta) {
+      paramCount++;
+      query += ` AND v.date_order <= $${paramCount}`;
+      params.push(hasta);
+    }
+    if (cliente_id) {
+      paramCount++;
+      query += ` AND v.cliente_id = $${paramCount}`;
+      params.push(cliente_id);
+    }
+
+    query += ` GROUP BY v.id, c.name ORDER BY v.date_order DESC, v.id DESC`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (e) {
+    console.error("ERROR /api/ventas:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// OBTENER DETALLE DE UNA VENTA
+app.get("/api/ventas/:id/detalle", async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const result = await pool.query(
+      `SELECT 
+        vd.*,
+        ma.name as marca,
+        m.name as modelo,
+        pd.imei_1,
+        pd.imei_2,
+        pr.name as proveedor
+      FROM ventas_detalle vd
+      INNER JOIN productos_detallados pd ON vd.producto_detallado_id = pd.id
+      INNER JOIN modelos m ON pd.modelo_id = m.id
+      INNER JOIN marcas ma ON m.marca_id = ma.id
+      LEFT JOIN pedidos_proveedor pp ON pd.pedido_id = pp.id
+      LEFT JOIN proveedores pr ON pp.proveedor_id = pr.id
+      WHERE vd.venta_id = $1
+      ORDER BY vd.id`,
+      [id]
+    );
+    
+    res.json(result.rows);
+  } catch (e) {
+    console.error("ERROR /api/ventas/:id/detalle:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// CREAR VENTA
+app.post("/api/ventas", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { cliente_id, date_order, productos } = req.body;
+    
+    if (!cliente_id || !date_order || !productos || productos.length === 0) {
+      return res.status(400).json({ error: "Faltan datos obligatorios" });
+    }
+
+    // Calcular total
+    const amount_total = productos.reduce((sum, p) => sum + parseFloat(p.precio_venta), 0);
+
+    // Crear venta
+    const ventaResult = await client.query(
+      `INSERT INTO ventas (cliente_id, date_order, amount_total, state) 
+       VALUES ($1, $2, $3, 'done') 
+       RETURNING id`,
+      [cliente_id, date_order, amount_total]
+    );
+    
+    const venta_id = ventaResult.rows[0].id;
+
+    // Insertar detalle y actualizar estado de productos
+    for (const producto of productos) {
+      const { producto_detallado_id, precio_venta } = producto;
+      
+      // Obtener costo del producto
+      const costoResult = await client.query(
+        'SELECT costo FROM productos_detallados WHERE id = $1',
+        [producto_detallado_id]
+      );
+      
+      if (costoResult.rows.length === 0) {
+        throw new Error(`Producto ${producto_detallado_id} no encontrado`);
+      }
+      
+      const costo = parseFloat(costoResult.rows[0].costo);
+      const margen = parseFloat(precio_venta) - costo;
+
+      // Insertar detalle
+      await client.query(
+        `INSERT INTO ventas_detalle (venta_id, producto_detallado_id, precio_venta, costo, margen) 
+         VALUES ($1, $2, $3, $4, $5)`,
+        [venta_id, producto_detallado_id, precio_venta, costo, margen]
+      );
+
+      // Marcar producto como vendido
+      await client.query(
+        `UPDATE productos_detallados 
+         SET estado = 'vendido' 
+         WHERE id = $1`,
+        [producto_detallado_id]
+      );
+    }
+
+    await client.query('COMMIT');
+    
+    res.json({ 
+      id: venta_id, 
+      message: "Venta creada correctamente",
+      total: amount_total
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error("ERROR POST /api/ventas:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ANULAR VENTA (devuelve productos al stock)
+app.delete("/api/ventas/:id", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { id } = req.params;
+
+    // Obtener productos de la venta
+    const productosResult = await client.query(
+      'SELECT producto_detallado_id FROM ventas_detalle WHERE venta_id = $1',
+      [id]
+    );
+
+    // Devolver productos al stock
+    for (const row of productosResult.rows) {
+      await client.query(
+        `UPDATE productos_detallados 
+         SET estado = 'en_stock' 
+         WHERE id = $1`,
+        [row.producto_detallado_id]
+      );
+    }
+
+    // Eliminar detalle y venta
+    await client.query('DELETE FROM ventas_detalle WHERE venta_id = $1', [id]);
+    await client.query('DELETE FROM ventas WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
+    
+    res.json({ message: "Venta anulada correctamente" });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error("ERROR DELETE /api/ventas:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
 // Llama a la función al inicio (después de crearTablas)
 agregarUpdatedAtPedidos();
 
