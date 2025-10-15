@@ -195,6 +195,8 @@ async function crearTablas() {
 
 // Inicializar tablas cuando se inicia el servidor
 crearTablas();
+crearTablaTiposEgreso();
+crearTablaEgresos();
 
 const PORT = process.env.PORT || 3001;
 
@@ -1200,6 +1202,170 @@ app.delete("/api/ventas/:id", async (req, res) => {
     client.release();
   }
 });
+// ===================== TIPOS DE EGRESO =====================
+
+// Crear tabla tipos_egreso
+async function crearTablaTiposEgreso() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tipos_egreso (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL UNIQUE,
+        descripcion TEXT,
+        activo BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log("✅ Tabla tipos_egreso verificada");
+  } catch (e) {
+    console.error("Error creando tipos_egreso:", e);
+  }
+}
+crearTablaTiposEgreso();
+
+// LISTAR TIPOS DE EGRESO
+app.get("/api/tipos-egreso", async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM tipos_egreso WHERE activo = true ORDER BY name'
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error("ERROR /api/tipos-egreso:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// CREAR TIPO DE EGRESO
+app.post("/api/tipos-egreso", async (req, res) => {
+  try {
+    const { name, descripcion } = req.body;
+    
+    if (!name) return res.status(400).json({ error: "Falta 'name'" });
+
+    const result = await pool.query(
+      `INSERT INTO tipos_egreso (name, descripcion) 
+       VALUES ($1, $2) 
+       RETURNING id, name, descripcion`,
+      [name, descripcion]
+    );
+
+    res.json({ 
+      id: result.rows[0].id,
+      message: "Tipo de egreso creado correctamente"
+    });
+  } catch (e) {
+    console.error("ERROR POST /api/tipos-egreso:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== EGRESOS =====================
+
+// Crear tabla egresos
+async function crearTablaEgresos() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS egresos (
+        id SERIAL PRIMARY KEY,
+        tipo_egreso_id INTEGER REFERENCES tipos_egreso(id),
+        monto DECIMAL(12,2) NOT NULL,
+        fecha DATE NOT NULL,
+        descripcion TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log("✅ Tabla egresos verificada");
+  } catch (e) {
+    console.error("Error creando egresos:", e);
+  }
+}
+crearTablaEgresos();
+
+// LISTAR EGRESOS (con filtro por fechas)
+app.get("/api/egresos", async (req, res) => {
+  try {
+    const { desde, hasta } = req.query;
+    
+    let query = `
+      SELECT 
+        e.*,
+        te.name as tipo_egreso_name
+      FROM egresos e
+      LEFT JOIN tipos_egreso te ON e.tipo_egreso_id = te.id
+      WHERE 1=1
+    `;
+    let params = [];
+    let paramCount = 0;
+
+    if (desde) {
+      paramCount++;
+      query += ` AND e.fecha >= $${paramCount}`;
+      params.push(desde);
+    }
+    if (hasta) {
+      paramCount++;
+      query += ` AND e.fecha <= $${paramCount}`;
+      params.push(hasta);
+    }
+
+    query += ` ORDER BY e.fecha DESC, e.id DESC`;
+
+    const result = await pool.query(query, params);
+    
+    // Convertir montos a números
+    const egresosProcesados = result.rows.map(egreso => ({
+      ...egreso,
+      monto: parseFloat(egreso.monto) || 0
+    }));
+    
+    res.json(egresosProcesados);
+  } catch (e) {
+    console.error("ERROR /api/egresos:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// CREAR EGRESO
+app.post("/api/egresos", async (req, res) => {
+  try {
+    const { tipo_egreso_id, monto, fecha, descripcion } = req.body;
+    
+    if (!tipo_egreso_id || !monto || !fecha) {
+      return res.status(400).json({ error: "Faltan campos obligatorios" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO egresos (tipo_egreso_id, monto, fecha, descripcion) 
+       VALUES ($1, $2, $3, $4) 
+       RETURNING id`,
+      [tipo_egreso_id, monto, fecha, descripcion]
+    );
+
+    res.json({ 
+      id: result.rows[0].id,
+      message: "Egreso registrado correctamente"
+    });
+  } catch (e) {
+    console.error("ERROR POST /api/egresos:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ELIMINAR EGRESO
+app.delete("/api/egresos/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    await pool.query('DELETE FROM egresos WHERE id = $1', [id]);
+
+    res.json({ message: "Egreso eliminado correctamente" });
+  } catch (e) {
+    console.error("ERROR DELETE /api/egresos:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Llama a la función al inicio (después de crearTablas)
 agregarUpdatedAtPedidos();
 
