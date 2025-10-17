@@ -192,11 +192,102 @@ async function crearTablas() {
     console.error("❌ Error creando tablas:", error);
   }
 }
+// ===================== ACTUALIZAR CUENTAS POR PAGAR =====================
+async function actualizarTablaCuentasPorPagar() {
+  try {
+    // Agregar columnas nuevas si no existen
+    await pool.query(`
+      DO $$ 
+      BEGIN
+        -- Agregar egreso_id si no existe
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='cuentas_por_pagar' AND column_name='egreso_id') THEN
+          ALTER TABLE cuentas_por_pagar ADD COLUMN egreso_id INTEGER REFERENCES egresos(id);
+        END IF;
+        
+        -- Agregar fecha_registro si no existe
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='cuentas_por_pagar' AND column_name='fecha_registro') THEN
+          ALTER TABLE cuentas_por_pagar ADD COLUMN fecha_registro DATE;
+        END IF;
+        
+        -- Agregar fecha_pago si no existe
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='cuentas_por_pagar' AND column_name='fecha_pago') THEN
+          ALTER TABLE cuentas_por_pagar ADD COLUMN fecha_pago DATE;
+        END IF;
+        
+        -- Agregar pagado si no existe
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='cuentas_por_pagar' AND column_name='pagado') THEN
+          ALTER TABLE cuentas_por_pagar ADD COLUMN pagado BOOLEAN DEFAULT false;
+        END IF;
+      END $$;
+    `);
+    
+    console.log("✅ Tabla cuentas_por_pagar actualizada");
+  } catch (e) {
+    console.error("Error actualizando cuentas_por_pagar:", e);
+  }
+}
 
-// Inicializar tablas cuando se inicia el servidor
+// Agregar columna tipo_egreso a egresos para identificar origen
+async function actualizarTablaEgresos() {
+  try {
+    await pool.query(`
+      DO $$ 
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='egresos' AND column_name='origen') THEN
+          ALTER TABLE egresos ADD COLUMN origen VARCHAR(50) DEFAULT 'manual';
+        END IF;
+        
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='egresos' AND column_name='pedido_proveedor_id') THEN
+          ALTER TABLE egresos ADD COLUMN pedido_proveedor_id INTEGER REFERENCES pedidos_proveedor(id);
+        END IF;
+      END $$;
+    `);
+    console.log("✅ Tabla egresos actualizada");
+  } catch (e) {
+    console.error("Error actualizando egresos:", e);
+  }
+}
+
+// ===================== ACTUALIZAR TABLA EGRESOS CON PAGADO =====================
+async function actualizarTablaEgresosPagado() {
+  try {
+    await pool.query(`
+      DO $$ 
+      BEGIN
+        -- Agregar pagado si no existe
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='egresos' AND column_name='pagado') THEN
+          ALTER TABLE egresos ADD COLUMN pagado BOOLEAN DEFAULT false;
+        END IF;
+        
+        -- Agregar fecha_pago si no existe
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='egresos' AND column_name='fecha_pago') THEN
+          ALTER TABLE egresos ADD COLUMN fecha_pago DATE;
+        END IF;
+      END $$;
+    `);
+    console.log("✅ Tabla egresos actualizada con pagado y fecha_pago");
+  } catch (e) {
+    console.error("Error actualizando egresos con pagado:", e);
+  }
+}
+
+// Llamar las funciones al inicio
 crearTablas();
 crearTablaTiposEgreso();
 crearTablaEgresos();
+actualizarTablaEgresos();
+actualizarTablaEgresosPagado(); // 👈 NUEVO
+actualizarTablaCuentasPorPagar();
+crearTablaVentasDetalle();
+agregarUpdatedAtPedidos();
 
 const PORT = process.env.PORT || 3001;
 
@@ -688,31 +779,7 @@ app.get("/api/pedidos-proveedor", async (req, res) => {
   }
 });
 
-// CREAR PEDIDO
-app.post("/api/pedidos-proveedor", async (req, res) => {
-  try {
-    const { proveedor_id, numero_pedido, fecha_pedido, fecha_entrega, observaciones } = req.body;
-    
-    if (!proveedor_id || !numero_pedido || !fecha_pedido) {
-      return res.status(400).json({ error: "Faltan campos obligatorios" });
-    }
 
-    const result = await pool.query(
-      `INSERT INTO pedidos_proveedor (proveedor_id, numero_pedido, fecha_pedido, fecha_entrega, observaciones) 
-       VALUES ($1, $2, $3, $4, $5) 
-       RETURNING id, numero_pedido, fecha_pedido, estado`,
-      [proveedor_id, numero_pedido, fecha_pedido, fecha_entrega, observaciones]
-    );
-
-    res.json({ 
-      id: result.rows[0].id,
-      message: "Pedido creado correctamente"
-    });
-  } catch (e) {
-    console.error("ERROR POST /api/pedidos-proveedor:", e);
-    res.status(500).json({ error: e.message });
-  }
-});
 
 // ===================== PRODUCTOS DETALLADOS =====================
 
@@ -788,35 +855,59 @@ app.post("/api/productos-detallados", async (req, res) => {
 });
 
 
-// ===================== ACTUALIZAR TOTAL DE PEDIDO =====================
+// ACTUALIZAR TOTAL DE PEDIDO (también actualiza egreso y cuenta por pagar)
 async function recalcularTotalPedido(pedidoId) {
+  const client = await pool.connect();
+  
   try {
+    await client.query('BEGIN');
+    
     // Sumar costos de productos activos del pedido
-    const totalResult = await pool.query(
+    const totalResult = await client.query(
       `SELECT COALESCE(SUM(costo), 0) as total 
        FROM productos_detallados 
-       WHERE pedido_id = $1 AND estado = 'en_stock'`,  // Solo en_stock
+       WHERE pedido_id = $1 AND estado = 'en_stock'`,
       [pedidoId]
     );
     
     const total = parseFloat(totalResult.rows[0].total);
 
     // Actualizar pedido
-    await pool.query(
+    await client.query(
       `UPDATE pedidos_proveedor 
        SET total = $1, updated_at = NOW()
        WHERE id = $2`,
       [total, pedidoId]
     );
     
-    console.log(`💰 Total recalculado para pedido ${pedidoId}: S/ ${total.toFixed(2)} (productos en stock)`);
+    // Actualizar egreso asociado
+    await client.query(
+      `UPDATE egresos 
+       SET monto = $1 
+       WHERE pedido_proveedor_id = $2`,
+      [total, pedidoId]
+    );
+    
+    // Actualizar cuenta por pagar asociada
+    await client.query(
+      `UPDATE cuentas_por_pagar 
+       SET monto = $1 
+       WHERE pedido_id = $2`,
+      [total, pedidoId]
+    );
+    
+    await client.query('COMMIT');
+    
+    console.log(`💰 Total recalculado para pedido ${pedidoId}: S/ ${total.toFixed(2)}`);
     return total;
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error("❌ Error recalculando total de pedido:", error);
     throw error;
+  } finally {
+    client.release();
   }
 }
-
 
 // ===================== INVENTARIO JERÁRQUICO =====================
 app.get("/api/inventario", async (req, res) => {
@@ -1282,7 +1373,7 @@ async function crearTablaEgresos() {
 }
 crearTablaEgresos();
 
-// LISTAR EGRESOS (con filtro por fechas)
+// LISTAR EGRESOS (con info de cuenta por pagar)
 app.get("/api/egresos", async (req, res) => {
   try {
     const { desde, hasta } = req.query;
@@ -1290,9 +1381,13 @@ app.get("/api/egresos", async (req, res) => {
     let query = `
       SELECT 
         e.*,
-        te.name as tipo_egreso_name
+        te.name as tipo_egreso_name,
+        cpp.id as cuenta_por_pagar_id,
+        cpp.pagado as cuenta_pagada,
+        cpp.fecha_pago as cuenta_fecha_pago
       FROM egresos e
       LEFT JOIN tipos_egreso te ON e.tipo_egreso_id = te.id
+      LEFT JOIN cuentas_por_pagar cpp ON e.id = cpp.egreso_id
       WHERE 1=1
     `;
     let params = [];
@@ -1313,10 +1408,11 @@ app.get("/api/egresos", async (req, res) => {
 
     const result = await pool.query(query, params);
     
-    // Convertir montos a números
     const egresosProcesados = result.rows.map(egreso => ({
       ...egreso,
-      monto: parseFloat(egreso.monto) || 0
+      monto: parseFloat(egreso.monto) || 0,
+      pagado: egreso.pagado || egreso.cuenta_pagada || false,
+      fecha_pago: egreso.fecha_pago || egreso.cuenta_fecha_pago || null
     }));
     
     res.json(egresosProcesados);
@@ -1326,42 +1422,276 @@ app.get("/api/egresos", async (req, res) => {
   }
 });
 
-// CREAR EGRESO
-app.post("/api/egresos", async (req, res) => {
+
+
+// ELIMINAR EGRESO (también elimina cuenta por pagar asociada)
+app.delete("/api/egresos/:id", async (req, res) => {
+  const client = await pool.connect();
+  
   try {
-    const { tipo_egreso_id, monto, fecha, descripcion } = req.body;
+    await client.query('BEGIN');
+    
+    const { id } = req.params;
+
+    // Verificar que existe
+    const existe = await client.query('SELECT id FROM egresos WHERE id = $1', [id]);
+    if (existe.rows.length === 0) {
+      return res.status(404).json({ error: "Egreso no encontrado" });
+    }
+
+    // Eliminar cuenta por pagar asociada primero
+    await client.query('DELETE FROM cuentas_por_pagar WHERE egreso_id = $1', [id]);
+    
+    // Eliminar egreso
+    await client.query('DELETE FROM egresos WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
+    
+    res.json({ message: "Egreso y cuenta por pagar eliminados correctamente" });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error("ERROR DELETE /api/egresos:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+// MARCAR EGRESO COMO PAGADO (sincroniza con cuenta por pagar)
+app.put("/api/egresos/:id/pagar", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { id } = req.params;
+    const fecha_pago = new Date().toISOString().split('T')[0];
+    
+    // Verificar que el egreso existe
+    const egresoExiste = await client.query('SELECT id FROM egresos WHERE id = $1', [id]);
+    if (egresoExiste.rows.length === 0) {
+      return res.status(404).json({ error: "Egreso no encontrado" });
+    }
+    
+    // Marcar egreso como pagado
+    await client.query(
+      `UPDATE egresos 
+       SET pagado = true, fecha_pago = $1 
+       WHERE id = $2`,
+      [fecha_pago, id]
+    );
+    
+    // Marcar cuenta por pagar asociada como pagada
+    await client.query(
+      `UPDATE cuentas_por_pagar 
+       SET pagado = true, fecha_pago = $1 
+       WHERE egreso_id = $2`,
+      [fecha_pago, id]
+    );
+    
+    await client.query('COMMIT');
+    
+    res.json({ 
+      message: "Egreso y cuenta por pagar marcados como pagados",
+      fecha_pago 
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error("ERROR PUT /api/egresos/:id/pagar:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// CREAR EGRESO OTROOOO
+app.post("/api/egresos", async (req, res) => { 
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { tipo_egreso_id, monto, fecha, descripcion, fecha_vencimiento, origen, pedido_proveedor_id } = req.body;
     
     if (!tipo_egreso_id || !monto || !fecha) {
       return res.status(400).json({ error: "Faltan campos obligatorios" });
     }
 
-    const result = await pool.query(
-      `INSERT INTO egresos (tipo_egreso_id, monto, fecha, descripcion) 
-       VALUES ($1, $2, $3, $4) 
+    // Crear egreso
+    const egresoResult = await client.query(
+      `INSERT INTO egresos (tipo_egreso_id, monto, fecha, descripcion, origen, pedido_proveedor_id) 
+       VALUES ($1, $2, $3, $4, $5, $6) 
        RETURNING id`,
-      [tipo_egreso_id, monto, fecha, descripcion]
+      [tipo_egreso_id, monto, fecha, descripcion || null, origen || 'manual', pedido_proveedor_id || null]
+    );
+    
+    const egreso_id = egresoResult.rows[0].id;
+
+    // Crear cuenta por pagar automáticamente
+    await client.query(
+      `INSERT INTO cuentas_por_pagar (egreso_id, monto, fecha_registro, fecha_vencimiento, descripcion, pagado) 
+       VALUES ($1, $2, $3, $4, $5, false)`,
+      [egreso_id, monto, fecha, fecha_vencimiento || null, descripcion || null]
     );
 
+    await client.query('COMMIT');
+    
     res.json({ 
-      id: result.rows[0].id,
-      message: "Egreso registrado correctamente"
+      id: egreso_id,
+      message: "Egreso y cuenta por pagar creados correctamente"
     });
   } catch (e) {
+    await client.query('ROLLBACK');
     console.error("ERROR POST /api/egresos:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// CREAR PEDIDO (ACTUALIZADO con egreso automático)
+app.post("/api/pedidos-proveedor", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { proveedor_id, numero_pedido, fecha_pedido, fecha_entrega, observaciones } = req.body;
+    
+    if (!proveedor_id || !numero_pedido || !fecha_pedido) {
+      return res.status(400).json({ error: "Faltan campos obligatorios" });
+    }
+
+    // Crear pedido
+    const pedidoResult = await client.query(
+      `INSERT INTO pedidos_proveedor (proveedor_id, numero_pedido, fecha_pedido, fecha_entrega, observaciones) 
+       VALUES ($1, $2, $3, $4, $5) 
+       RETURNING id, numero_pedido, fecha_pedido, estado`,
+      [proveedor_id, numero_pedido, fecha_pedido, fecha_entrega, observaciones]
+    );
+    
+    const pedido_id = pedidoResult.rows[0].id;
+
+    // Buscar o crear tipo de egreso "Pedidos a Proveedores"
+    let tipoEgresoResult = await client.query(
+      `SELECT id FROM tipos_egreso WHERE name = 'Pedidos a Proveedores' LIMIT 1`
+    );
+    
+    let tipo_egreso_id;
+    if (tipoEgresoResult.rows.length === 0) {
+      const nuevoTipo = await client.query(
+        `INSERT INTO tipos_egreso (name, descripcion) 
+         VALUES ('Pedidos a Proveedores', 'Egresos generados automáticamente por pedidos a proveedores') 
+         RETURNING id`
+      );
+      tipo_egreso_id = nuevoTipo.rows[0].id;
+    } else {
+      tipo_egreso_id = tipoEgresoResult.rows[0].id;
+    }
+
+    // Crear egreso automático (monto inicial en 0, se actualizará al agregar productos)
+    const egresoResult = await client.query(
+      `INSERT INTO egresos (tipo_egreso_id, monto, fecha, descripcion, origen, pedido_proveedor_id) 
+       VALUES ($1, $2, $3, $4, 'pedido_proveedor', $5) 
+       RETURNING id`,
+      [tipo_egreso_id, 0, fecha_pedido, `Pedido ${numero_pedido}`, pedido_id]
+    );
+    
+    const egreso_id = egresoResult.rows[0].id;
+
+    // Crear cuenta por pagar automáticamente CON fecha_registro
+    await client.query(
+      `INSERT INTO cuentas_por_pagar (proveedor_id, pedido_id, egreso_id, monto, fecha_registro, descripcion, pagado) 
+       VALUES ($1, $2, $3, $4, $5, $6, false)`,
+      [proveedor_id, pedido_id, egreso_id, 0, fecha_pedido, `Pedido ${numero_pedido}`]
+    );
+
+    await client.query('COMMIT');
+    
+    res.json({ 
+      id: pedido_id,
+      message: "Pedido, egreso y cuenta por pagar creados correctamente"
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error("ERROR POST /api/pedidos-proveedor:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ===================== CUENTAS POR PAGAR =====================
+
+// ===================== CUENTAS POR PAGAR =====================
+
+// LISTAR CUENTAS POR PAGAR (ACTUALIZADO)
+app.get("/api/cuentas-por-pagar", async (req, res) => {
+  try {
+    const { pendientes } = req.query;
+    
+    let query = `
+      SELECT 
+        cpp.*,
+        pr.name as proveedor_name,
+        te.name as tipo_egreso_name,
+        e.descripcion as egreso_descripcion,
+        e.origen as egreso_origen,
+        e.fecha as egreso_fecha,
+        pp.numero_pedido
+      FROM cuentas_por_pagar cpp
+      LEFT JOIN proveedores pr ON cpp.proveedor_id = pr.id
+      LEFT JOIN egresos e ON cpp.egreso_id = e.id
+      LEFT JOIN tipos_egreso te ON e.tipo_egreso_id = te.id
+      LEFT JOIN pedidos_proveedor pp ON cpp.pedido_id = pp.id
+      WHERE 1=1
+    `;
+    
+    if (pendientes === 'true') {
+      query += ` AND cpp.pagado = false`;
+    }
+    
+    query += ` ORDER BY 
+      CASE WHEN cpp.pagado = false THEN 0 ELSE 1 END,
+      cpp.fecha_vencimiento ASC NULLS LAST, 
+      cpp.fecha_registro DESC`;
+    
+    const result = await pool.query(query);
+    
+    const cuentasProcesadas = result.rows.map(cuenta => ({
+      ...cuenta,
+      monto: parseFloat(cuenta.monto) || 0,
+      // Si no existe fecha_registro, usar la fecha del egreso
+      fecha_registro: cuenta.fecha_registro || cuenta.egreso_fecha,
+      // Usar descripción del egreso si no hay descripción en cuenta
+      descripcion: cuenta.descripcion || cuenta.egreso_descripcion
+    }));
+    
+    res.json(cuentasProcesadas);
+  } catch (e) {
+    console.error("ERROR /api/cuentas-por-pagar:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// ELIMINAR EGRESO
-app.delete("/api/egresos/:id", async (req, res) => {
+// MARCAR CUENTA COMO PAGADA
+app.put("/api/cuentas-por-pagar/:id/pagar", async (req, res) => {
   try {
     const { id } = req.params;
-
-    await pool.query('DELETE FROM egresos WHERE id = $1', [id]);
-
-    res.json({ message: "Egreso eliminado correctamente" });
+    const fecha_pago = new Date().toISOString().split('T')[0];
+    
+    await pool.query(
+      `UPDATE cuentas_por_pagar 
+       SET pagado = true, fecha_pago = $1 
+       WHERE id = $2`,
+      [fecha_pago, id]
+    );
+    
+    res.json({ 
+      message: "Cuenta marcada como pagada",
+      fecha_pago 
+    });
   } catch (e) {
-    console.error("ERROR DELETE /api/egresos:", e);
+    console.error("ERROR PUT /api/cuentas-por-pagar/:id/pagar:", e);
     res.status(500).json({ error: e.message });
   }
 });
