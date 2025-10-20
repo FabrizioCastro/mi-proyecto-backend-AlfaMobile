@@ -279,15 +279,103 @@ async function actualizarTablaEgresosPagado() {
   }
 }
 
+// ===================== CREAR TABLA CUENTAS POR COBRAR =====================
+async function crearTablaCuentasPorCobrar() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cuentas_por_cobrar (
+        id SERIAL PRIMARY KEY,
+        venta_id INTEGER REFERENCES ventas(id) ON DELETE CASCADE,
+        cliente_id INTEGER REFERENCES clientes(id),
+        monto DECIMAL(12,2) NOT NULL,
+        fecha_registro DATE NOT NULL,
+        fecha_vencimiento DATE,
+        fecha_cobro DATE,
+        cobrado BOOLEAN DEFAULT false,
+        descripcion TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log("✅ Tabla cuentas_por_cobrar verificada");
+  } catch (e) {
+    console.error("Error creando cuentas_por_cobrar:", e);
+  }
+}
+
+// ACTUALIZAR TABLA VENTAS CON CAMPOS DE PAGO
+async function actualizarTablaVentasPagado() {
+  try {
+    await pool.query(`
+      DO $$ 
+      BEGIN
+        -- Agregar pagado si no existe
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='ventas' AND column_name='pagado') THEN
+          ALTER TABLE ventas ADD COLUMN pagado BOOLEAN DEFAULT false;
+        END IF;
+        
+        -- Agregar fecha_pago si no existe
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='ventas' AND column_name='fecha_pago') THEN
+          ALTER TABLE ventas ADD COLUMN fecha_pago DATE;
+        END IF;
+      END $$;
+    `);
+    console.log("✅ Tabla ventas actualizada con pagado y fecha_pago");
+  } catch (e) {
+    console.error("Error actualizando ventas con pagado:", e);
+  }
+}
+
+// 1. ACTUALIZAR TABLA VENTAS - Agregar campo 'anulado'
+async function actualizarTablaVentasAnulado() {
+  try {
+    await pool.query(`
+      DO $$ 
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='ventas' AND column_name='anulado') THEN
+          ALTER TABLE ventas ADD COLUMN anulado BOOLEAN DEFAULT false;
+        END IF;
+      END $$;
+    `);
+    console.log("✅ Tabla ventas actualizada con campo anulado");
+  } catch (e) {
+    console.error("Error actualizando ventas con anulado:", e);
+  }
+}
+
+// 2. ACTUALIZAR TABLA EGRESOS - Agregar campo 'eliminado'
+async function actualizarTablaEgresosEliminado() {
+  try {
+    await pool.query(`
+      DO $$ 
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                      WHERE table_name='egresos' AND column_name='eliminado') THEN
+          ALTER TABLE egresos ADD COLUMN eliminado BOOLEAN DEFAULT false;
+        END IF;
+      END $$;
+    `);
+    console.log("✅ Tabla egresos actualizada con campo eliminado");
+  } catch (e) {
+    console.error("Error actualizando egresos con eliminado:", e);
+  }
+}
+
 // Llamar las funciones al inicio
 crearTablas();
 crearTablaTiposEgreso();
 crearTablaEgresos();
 actualizarTablaEgresos();
-actualizarTablaEgresosPagado(); // 👈 NUEVO
+actualizarTablaEgresosPagado();
 actualizarTablaCuentasPorPagar();
 crearTablaVentasDetalle();
+crearTablaCuentasPorCobrar(); // 👈 NUEVO
 agregarUpdatedAtPedidos();
+actualizarTablaVentasPagado();
+actualizarTablaVentasAnulado();
+actualizarTablaEgresosEliminado();
 
 const PORT = process.env.PORT || 3001;
 
@@ -1102,15 +1190,15 @@ async function crearTablaVentasDetalle() {
 }
 crearTablaVentasDetalle();
 
-// LISTAR VENTAS (con detalles de productos)
 app.get("/api/ventas", async (req, res) => {
   try {
-    const { desde, hasta, cliente_id } = req.query;
+    const { desde, hasta, cliente_id, incluir_anuladas } = req.query;
     
     let query = `
       SELECT 
         v.*,
         c.name as cliente_name,
+        c.vat as cliente_dni,
         COUNT(vd.id) as productos_count,
         COALESCE(SUM(vd.precio_venta), 0) as total_real
       FROM ventas v
@@ -1120,6 +1208,11 @@ app.get("/api/ventas", async (req, res) => {
     `;
     let params = [];
     let paramCount = 0;
+
+    // Por defecto, NO mostrar anuladas
+    if (incluir_anuladas !== 'true') {
+      query += ` AND (v.anulado = false OR v.anulado IS NULL)`;
+    }
 
     if (desde) {
       paramCount++;
@@ -1137,15 +1230,27 @@ app.get("/api/ventas", async (req, res) => {
       params.push(cliente_id);
     }
 
-    query += ` GROUP BY v.id, c.name ORDER BY v.date_order DESC, v.id DESC`;
+    query += ` GROUP BY v.id, c.name, c.vat ORDER BY v.date_order DESC, v.id DESC`;
 
     const result = await pool.query(query, params);
-    res.json(result.rows);
+    
+    const ventasProcesadas = result.rows.map(venta => ({
+      ...venta,
+      total_real: parseFloat(venta.total_real) || 0,
+      pagado: venta.pagado || false,
+      fecha_pago: venta.fecha_pago || null,
+      anulado: venta.anulado || false
+    }));
+    
+    res.json(ventasProcesadas);
   } catch (e) {
     console.error("ERROR /api/ventas:", e);
     res.status(500).json({ error: e.message });
   }
 });
+
+
+
 
 // OBTENER DETALLE DE UNA VENTA
 app.get("/api/ventas/:id/detalle", async (req, res) => {
@@ -1178,14 +1283,14 @@ app.get("/api/ventas/:id/detalle", async (req, res) => {
   }
 });
 
-// CREAR VENTA
+// CREAR VENTA (con cuenta por cobrar automática Y pagado=false)
 app.post("/api/ventas", async (req, res) => {
   const client = await pool.connect();
   
   try {
     await client.query('BEGIN');
     
-    const { cliente_id, date_order, productos } = req.body;
+    const { cliente_id, date_order, productos, fecha_vencimiento } = req.body;
     
     if (!cliente_id || !date_order || !productos || productos.length === 0) {
       return res.status(400).json({ error: "Faltan datos obligatorios" });
@@ -1194,10 +1299,10 @@ app.post("/api/ventas", async (req, res) => {
     // Calcular total
     const amount_total = productos.reduce((sum, p) => sum + parseFloat(p.precio_venta), 0);
 
-    // Crear venta
+    // 👇 CREAR VENTA CON pagado=false POR DEFECTO
     const ventaResult = await client.query(
-      `INSERT INTO ventas (cliente_id, date_order, amount_total, state) 
-       VALUES ($1, $2, $3, 'done') 
+      `INSERT INTO ventas (cliente_id, date_order, amount_total, state, pagado) 
+       VALUES ($1, $2, $3, 'done', false) 
        RETURNING id`,
       [cliente_id, date_order, amount_total]
     );
@@ -1237,11 +1342,18 @@ app.post("/api/ventas", async (req, res) => {
       );
     }
 
+    // Crear cuenta por cobrar automáticamente
+    await client.query(
+      `INSERT INTO cuentas_por_cobrar (venta_id, cliente_id, monto, fecha_registro, fecha_vencimiento, cobrado) 
+       VALUES ($1, $2, $3, $4, $5, false)`,
+      [venta_id, cliente_id, amount_total, date_order, fecha_vencimiento || null]
+    );
+
     await client.query('COMMIT');
     
     res.json({ 
       id: venta_id, 
-      message: "Venta creada correctamente",
+      message: "Venta y cuenta por cobrar creadas correctamente",
       total: amount_total
     });
   } catch (e) {
@@ -1253,7 +1365,7 @@ app.post("/api/ventas", async (req, res) => {
   }
 });
 
-// ANULAR VENTA (devuelve productos al stock)
+
 app.delete("/api/ventas/:id", async (req, res) => {
   const client = await pool.connect();
   
@@ -1262,6 +1374,14 @@ app.delete("/api/ventas/:id", async (req, res) => {
     
     const { id } = req.params;
 
+    const existe = await client.query('SELECT id FROM ventas WHERE id = $1', [id]);
+    if (existe.rows.length === 0) {
+      return res.status(404).json({ error: "Venta no encontrada" });
+    }
+
+    // Marcar venta como anulada
+    await client.query('UPDATE ventas SET anulado = true WHERE id = $1', [id]);
+    
     // Obtener productos de la venta
     const productosResult = await client.query(
       'SELECT producto_detallado_id FROM ventas_detalle WHERE venta_id = $1',
@@ -1271,16 +1391,10 @@ app.delete("/api/ventas/:id", async (req, res) => {
     // Devolver productos al stock
     for (const row of productosResult.rows) {
       await client.query(
-        `UPDATE productos_detallados 
-         SET estado = 'en_stock' 
-         WHERE id = $1`,
+        `UPDATE productos_detallados SET estado = 'en_stock' WHERE id = $1`,
         [row.producto_detallado_id]
       );
     }
-
-    // Eliminar detalle y venta
-    await client.query('DELETE FROM ventas_detalle WHERE venta_id = $1', [id]);
-    await client.query('DELETE FROM ventas WHERE id = $1', [id]);
 
     await client.query('COMMIT');
     
@@ -1288,6 +1402,54 @@ app.delete("/api/ventas/:id", async (req, res) => {
   } catch (e) {
     await client.query('ROLLBACK');
     console.error("ERROR DELETE /api/ventas:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+// MARCAR VENTA COMO PAGADA (sincroniza con cuenta por cobrar)
+app.put("/api/ventas/:id/pagar", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { id } = req.params;
+    const fecha_pago = new Date().toISOString().split('T')[0];
+    
+    // Verificar que la venta existe
+    const ventaExiste = await client.query('SELECT id FROM ventas WHERE id = $1', [id]);
+    if (ventaExiste.rows.length === 0) {
+      return res.status(404).json({ error: "Venta no encontrada" });
+    }
+    
+    // Marcar venta como pagada
+    await client.query(
+      `UPDATE ventas 
+       SET pagado = true, fecha_pago = $1 
+       WHERE id = $2`,
+      [fecha_pago, id]
+    );
+    
+    // Marcar cuenta por cobrar asociada como cobrada
+    await client.query(
+      `UPDATE cuentas_por_cobrar 
+       SET cobrado = true, fecha_cobro = $1 
+       WHERE venta_id = $2`,
+      [fecha_pago, id]
+    );
+    
+    await client.query('COMMIT');
+    
+    res.json({ 
+      message: "Venta y cuenta por cobrar marcadas como pagadas",
+      fecha_pago 
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error("ERROR PUT /api/ventas/:id/pagar:", e);
     res.status(500).json({ error: e.message });
   } finally {
     client.release();
@@ -1373,10 +1535,10 @@ async function crearTablaEgresos() {
 }
 crearTablaEgresos();
 
-// LISTAR EGRESOS (con info de cuenta por pagar)
+// LISTAR EGRESOS (con info de cuenta por pagar Y nombre del proveedor)
 app.get("/api/egresos", async (req, res) => {
   try {
-    const { desde, hasta } = req.query;
+    const { desde, hasta, incluir_eliminados } = req.query;
     
     let query = `
       SELECT 
@@ -1384,14 +1546,23 @@ app.get("/api/egresos", async (req, res) => {
         te.name as tipo_egreso_name,
         cpp.id as cuenta_por_pagar_id,
         cpp.pagado as cuenta_pagada,
-        cpp.fecha_pago as cuenta_fecha_pago
+        cpp.fecha_pago as cuenta_fecha_pago,
+        pp.numero_pedido,
+        pr.name as proveedor_name
       FROM egresos e
       LEFT JOIN tipos_egreso te ON e.tipo_egreso_id = te.id
       LEFT JOIN cuentas_por_pagar cpp ON e.id = cpp.egreso_id
+      LEFT JOIN pedidos_proveedor pp ON e.pedido_proveedor_id = pp.id
+      LEFT JOIN proveedores pr ON pp.proveedor_id = pr.id
       WHERE 1=1
     `;
     let params = [];
     let paramCount = 0;
+
+    // Por defecto, NO mostrar eliminados
+    if (incluir_eliminados !== 'true') {
+      query += ` AND (e.eliminado = false OR e.eliminado IS NULL)`;
+    }
 
     if (desde) {
       paramCount++;
@@ -1412,7 +1583,8 @@ app.get("/api/egresos", async (req, res) => {
       ...egreso,
       monto: parseFloat(egreso.monto) || 0,
       pagado: egreso.pagado || egreso.cuenta_pagada || false,
-      fecha_pago: egreso.fecha_pago || egreso.cuenta_fecha_pago || null
+      fecha_pago: egreso.fecha_pago || egreso.cuenta_fecha_pago || null,
+      eliminado: egreso.eliminado || false
     }));
     
     res.json(egresosProcesados);
@@ -1421,7 +1593,6 @@ app.get("/api/egresos", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
 
 
 // ELIMINAR EGRESO (también elimina cuenta por pagar asociada)
@@ -1433,21 +1604,17 @@ app.delete("/api/egresos/:id", async (req, res) => {
     
     const { id } = req.params;
 
-    // Verificar que existe
     const existe = await client.query('SELECT id FROM egresos WHERE id = $1', [id]);
     if (existe.rows.length === 0) {
       return res.status(404).json({ error: "Egreso no encontrado" });
     }
 
-    // Eliminar cuenta por pagar asociada primero
-    await client.query('DELETE FROM cuentas_por_pagar WHERE egreso_id = $1', [id]);
-    
-    // Eliminar egreso
-    await client.query('DELETE FROM egresos WHERE id = $1', [id]);
+    // Marcar como eliminado (soft delete)
+    await client.query('UPDATE egresos SET eliminado = true WHERE id = $1', [id]);
 
     await client.query('COMMIT');
     
-    res.json({ message: "Egreso y cuenta por pagar eliminados correctamente" });
+    res.json({ message: "Egreso eliminado correctamente" });
   } catch (e) {
     await client.query('ROLLBACK');
     console.error("ERROR DELETE /api/egresos:", e);
@@ -1456,6 +1623,7 @@ app.delete("/api/egresos/:id", async (req, res) => {
     client.release();
   }
 });
+
 // MARCAR EGRESO COMO PAGADO (sincroniza con cuenta por pagar)
 app.put("/api/egresos/:id/pagar", async (req, res) => {
   const client = await pool.connect();
@@ -1637,13 +1805,14 @@ app.get("/api/cuentas-por-pagar", async (req, res) => {
         e.descripcion as egreso_descripcion,
         e.origen as egreso_origen,
         e.fecha as egreso_fecha,
+        e.eliminado as egreso_eliminado,
         pp.numero_pedido
       FROM cuentas_por_pagar cpp
       LEFT JOIN proveedores pr ON cpp.proveedor_id = pr.id
       LEFT JOIN egresos e ON cpp.egreso_id = e.id
       LEFT JOIN tipos_egreso te ON e.tipo_egreso_id = te.id
       LEFT JOIN pedidos_proveedor pp ON cpp.pedido_id = pp.id
-      WHERE 1=1
+      WHERE (e.eliminado = false OR e.eliminado IS NULL)
     `;
     
     if (pendientes === 'true') {
@@ -1660,9 +1829,7 @@ app.get("/api/cuentas-por-pagar", async (req, res) => {
     const cuentasProcesadas = result.rows.map(cuenta => ({
       ...cuenta,
       monto: parseFloat(cuenta.monto) || 0,
-      // Si no existe fecha_registro, usar la fecha del egreso
       fecha_registro: cuenta.fecha_registro || cuenta.egreso_fecha,
-      // Usar descripción del egreso si no hay descripción en cuenta
       descripcion: cuenta.descripcion || cuenta.egreso_descripcion
     }));
     
@@ -1695,6 +1862,606 @@ app.put("/api/cuentas-por-pagar/:id/pagar", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ===================== CUENTAS POR COBRAR =====================
+
+// LISTAR CUENTAS POR COBRAR
+app.get("/api/cuentas-por-cobrar", async (req, res) => {
+  try {
+    const { pendientes } = req.query;
+    
+    let query = `
+      SELECT 
+        cpc.*,
+        c.name as cliente_name,
+        c.email as cliente_email,
+        c.phone as cliente_phone,
+        v.date_order as fecha_venta,
+        v.anulado as venta_anulada
+      FROM cuentas_por_cobrar cpc
+      LEFT JOIN clientes c ON cpc.cliente_id = c.id
+      LEFT JOIN ventas v ON cpc.venta_id = v.id
+      WHERE (v.anulado = false OR v.anulado IS NULL)
+    `;
+    
+    if (pendientes === 'true') {
+      query += ` AND cpc.cobrado = false`;
+    }
+    
+    query += ` ORDER BY 
+      CASE WHEN cpc.cobrado = false THEN 0 ELSE 1 END,
+      cpc.fecha_vencimiento ASC NULLS LAST, 
+      cpc.fecha_registro DESC`;
+    
+    const result = await pool.query(query);
+    
+    const cuentasProcesadas = result.rows.map(cuenta => ({
+      ...cuenta,
+      monto: parseFloat(cuenta.monto) || 0
+    }));
+    
+    res.json(cuentasProcesadas);
+  } catch (e) {
+    console.error("ERROR /api/cuentas-por-cobrar:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// MARCAR CUENTA POR COBRAR COMO COBRADA
+app.put("/api/cuentas-por-cobrar/:id/cobrar", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const fecha_cobro = new Date().toISOString().split('T')[0];
+    
+    await pool.query(
+      `UPDATE cuentas_por_cobrar 
+       SET cobrado = true, fecha_cobro = $1 
+       WHERE id = $2`,
+      [fecha_cobro, id]
+    );
+    
+    res.json({ 
+      message: "Cuenta marcada como cobrada",
+      fecha_cobro 
+    });
+  } catch (e) {
+    console.error("ERROR PUT /api/cuentas-por-cobrar/:id/cobrar:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DESMARCAR VENTA COMO PAGADA
+app.put("/api/ventas/:id/desmarcar-pago", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { id } = req.params;
+    
+    await client.query(
+      `UPDATE ventas SET pagado = false, fecha_pago = NULL WHERE id = $1`,
+      [id]
+    );
+    
+    await client.query(
+      `UPDATE cuentas_por_cobrar SET cobrado = false, fecha_cobro = NULL WHERE venta_id = $1`,
+      [id]
+    );
+    
+    await client.query('COMMIT');
+    
+    res.json({ message: "Venta desmarcada como pagada correctamente" });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error("ERROR PUT /api/ventas/:id/desmarcar-pago:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// RECUPERAR VENTA ANULADA
+app.put("/api/ventas/:id/recuperar", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { id } = req.params;
+
+    const venta = await client.query('SELECT id, anulado FROM ventas WHERE id = $1', [id]);
+    
+    if (venta.rows.length === 0) {
+      return res.status(404).json({ error: "Venta no encontrada" });
+    }
+    
+    if (!venta.rows[0].anulado) {
+      return res.status(400).json({ error: "La venta no está anulada" });
+    }
+
+    // Obtener productos de la venta
+    const productosResult = await client.query(
+      'SELECT producto_detallado_id FROM ventas_detalle WHERE venta_id = $1',
+      [id]
+    );
+
+    // Marcar productos como vendidos nuevamente
+    for (const row of productosResult.rows) {
+      await client.query(
+        `UPDATE productos_detallados SET estado = 'vendido' WHERE id = $1`,
+        [row.producto_detallado_id]
+      );
+    }
+
+    // Desmarcar como anulada
+    await client.query('UPDATE ventas SET anulado = false WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
+    
+    res.json({ message: "Venta recuperada correctamente" });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error("ERROR PUT /api/ventas/:id/recuperar:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+// DESMARCAR EGRESO COMO PAGADO
+app.put("/api/egresos/:id/desmarcar-pago", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { id } = req.params;
+    
+    await client.query(
+      `UPDATE egresos SET pagado = false, fecha_pago = NULL WHERE id = $1`,
+      [id]
+    );
+    
+    await client.query(
+      `UPDATE cuentas_por_pagar SET pagado = false, fecha_pago = NULL WHERE egreso_id = $1`,
+      [id]
+    );
+    
+    await client.query('COMMIT');
+    
+    res.json({ message: "Egreso desmarcado como pagado correctamente" });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error("ERROR PUT /api/egresos/:id/desmarcar-pago:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+// RECUPERAR EGRESO ELIMINADO
+app.put("/api/egresos/:id/recuperar", async (req, res) => {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const { id } = req.params;
+
+    const egreso = await client.query('SELECT id, eliminado FROM egresos WHERE id = $1', [id]);
+    
+    if (egreso.rows.length === 0) {
+      return res.status(404).json({ error: "Egreso no encontrado" });
+    }
+    
+    if (!egreso.rows[0].eliminado) {
+      return res.status(400).json({ error: "El egreso no está eliminado" });
+    }
+
+    // Desmarcar como eliminado
+    await client.query('UPDATE egresos SET eliminado = false WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
+    
+    res.json({ message: "Egreso recuperado correctamente" });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error("ERROR PUT /api/egresos/:id/recuperar:", e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// COMPARATIVO FINANCIERO - Ingresos vs Egresos
+app.get("/api/comparativo-financiero", async (req, res) => {
+  try {
+    const { desde, hasta, agrupacion } = req.query;
+    
+    if (!desde || !hasta) {
+      return res.status(400).json({ error: "Faltan parámetros 'desde' y 'hasta'" });
+    }
+
+    const validAgrupaciones = ['dia', 'mes', 'año'];
+    const agrupar = validAgrupaciones.includes(agrupacion) ? agrupacion : 'mes';
+
+    // Determinar formato SQL según agrupación
+    let formatSQL;
+    if (agrupar === 'dia') {
+      formatSQL = "TO_CHAR(v.date_order, 'YYYY-MM-DD')";
+      formatSQLEgresos = "TO_CHAR(e.fecha, 'YYYY-MM-DD')";
+    } else if (agrupar === 'año') {
+      formatSQL = "TO_CHAR(v.date_order, 'YYYY')";
+      formatSQLEgresos = "TO_CHAR(e.fecha, 'YYYY')";
+    } else {
+      formatSQL = "TO_CHAR(v.date_order, 'YYYY-MM')";
+      formatSQLEgresos = "TO_CHAR(e.fecha, 'YYYY-MM')";
+    }
+
+    // INGRESOS - Solo ventas PAGADAS y NO ANULADAS
+    const ingresosQuery = `
+      SELECT 
+        ${formatSQL} as periodo,
+        COALESCE(SUM(vd.precio_venta), 0) as total_ingresos,
+        COUNT(DISTINCT v.id) as cantidad_ventas
+      FROM ventas v
+      LEFT JOIN ventas_detalle vd ON v.id = vd.venta_id
+      WHERE v.date_order >= $1 
+        AND v.date_order <= $2
+        AND v.pagado = true
+        AND (v.anulado = false OR v.anulado IS NULL)
+      GROUP BY ${formatSQL}
+      ORDER BY periodo
+    `;
+
+    // EGRESOS - Solo egresos PAGADOS y NO ELIMINADOS
+    const egresosQuery = `
+      SELECT 
+        ${formatSQLEgresos} as periodo,
+        COALESCE(SUM(e.monto), 0) as total_egresos,
+        COUNT(e.id) as cantidad_egresos
+      FROM egresos e
+      WHERE e.fecha >= $1 
+        AND e.fecha <= $2
+        AND e.pagado = true
+        AND (e.eliminado = false OR e.eliminado IS NULL)
+      GROUP BY ${formatSQLEgresos}
+      ORDER BY periodo
+    `;
+
+    const [ingresosResult, egresosResult] = await Promise.all([
+      pool.query(ingresosQuery, [desde, hasta]),
+      pool.query(egresosQuery, [desde, hasta])
+    ]);
+
+    // Combinar resultados
+    const periodosMap = new Map();
+
+    ingresosResult.rows.forEach(row => {
+      periodosMap.set(row.periodo, {
+        periodo: row.periodo,
+        ingresos: parseFloat(row.total_ingresos) || 0,
+        cantidad_ventas: parseInt(row.cantidad_ventas) || 0,
+        egresos: 0,
+        cantidad_egresos: 0,
+        utilidad: 0
+      });
+    });
+
+    egresosResult.rows.forEach(row => {
+      if (periodosMap.has(row.periodo)) {
+        const periodo = periodosMap.get(row.periodo);
+        periodo.egresos = parseFloat(row.total_egresos) || 0;
+        periodo.cantidad_egresos = parseInt(row.cantidad_egresos) || 0;
+      } else {
+        periodosMap.set(row.periodo, {
+          periodo: row.periodo,
+          ingresos: 0,
+          cantidad_ventas: 0,
+          egresos: parseFloat(row.total_egresos) || 0,
+          cantidad_egresos: parseInt(row.cantidad_egresos) || 0,
+          utilidad: 0
+        });
+      }
+    });
+
+    const periodos = Array.from(periodosMap.values())
+      .map(p => ({
+        ...p,
+        utilidad: p.ingresos - p.egresos
+      }))
+      .sort((a, b) => a.periodo.localeCompare(b.periodo));
+
+    const totales = {
+      ingresos_totales: periodos.reduce((sum, p) => sum + p.ingresos, 0),
+      egresos_totales: periodos.reduce((sum, p) => sum + p.egresos, 0),
+      utilidad_total: 0,
+      total_ventas: periodos.reduce((sum, p) => sum + p.cantidad_ventas, 0),
+      total_egresos: periodos.reduce((sum, p) => sum + p.cantidad_egresos, 0)
+    };
+    totales.utilidad_total = totales.ingresos_totales - totales.egresos_totales;
+
+    let mejorPeriodo = null;
+    let peorPeriodo = null;
+    
+    if (periodos.length > 0) {
+      mejorPeriodo = periodos.reduce((max, p) => 
+        p.utilidad > max.utilidad ? p : max
+      , periodos[0]);
+      
+      peorPeriodo = periodos.reduce((min, p) => 
+        p.utilidad < min.utilidad ? p : min
+      , periodos[0]);
+    }
+
+    res.json({
+      agrupacion: agrupar,
+      desde,
+      hasta,
+      periodos,
+      totales,
+      mejorPeriodo,
+      peorPeriodo
+    });
+
+  } catch (e) {
+    console.error("ERROR /api/comparativo-financiero:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== AGREGAR ESTE ENDPOINT EN TU server.js =====================
+// Colócalo ANTES de app.listen (al final del archivo, junto con los otros endpoints)
+
+app.get("/api/comparar-periodos", async (req, res) => {
+  try {
+    const { fecha1_desde, fecha1_hasta, fecha2_desde, fecha2_hasta } = req.query;
+    
+    if (!fecha1_desde || !fecha1_hasta || !fecha2_desde || !fecha2_hasta) {
+      return res.status(400).json({ 
+        error: "Faltan parámetros obligatorios: fecha1_desde, fecha1_hasta, fecha2_desde, fecha2_hasta" 
+      });
+    }
+
+    // PERIODO 1 - Ingresos (solo ventas PAGADAS y NO ANULADAS)
+    const ingresos1Query = `
+      SELECT 
+        COALESCE(SUM(vd.precio_venta), 0) as total,
+        COUNT(DISTINCT v.id) as cantidad
+      FROM ventas v
+      LEFT JOIN ventas_detalle vd ON v.id = vd.venta_id
+      WHERE v.date_order >= $1 
+        AND v.date_order <= $2
+        AND v.pagado = true
+        AND (v.anulado = false OR v.anulado IS NULL)
+    `;
+
+    // PERIODO 1 - Egresos (solo egresos PAGADOS y NO ELIMINADOS)
+    const egresos1Query = `
+      SELECT 
+        COALESCE(SUM(e.monto), 0) as total,
+        COUNT(e.id) as cantidad
+      FROM egresos e
+      WHERE e.fecha >= $1 
+        AND e.fecha <= $2
+        AND e.pagado = true
+        AND (e.eliminado = false OR e.eliminado IS NULL)
+    `;
+
+    // PERIODO 2 - Ingresos
+    const ingresos2Query = `
+      SELECT 
+        COALESCE(SUM(vd.precio_venta), 0) as total,
+        COUNT(DISTINCT v.id) as cantidad
+      FROM ventas v
+      LEFT JOIN ventas_detalle vd ON v.id = vd.venta_id
+      WHERE v.date_order >= $1 
+        AND v.date_order <= $2
+        AND v.pagado = true
+        AND (v.anulado = false OR v.anulado IS NULL)
+    `;
+
+    // PERIODO 2 - Egresos
+    const egresos2Query = `
+      SELECT 
+        COALESCE(SUM(e.monto), 0) as total,
+        COUNT(e.id) as cantidad
+      FROM egresos e
+      WHERE e.fecha >= $1 
+        AND e.fecha <= $2
+        AND e.pagado = true
+        AND (e.eliminado = false OR e.eliminado IS NULL)
+    `;
+
+    // Ejecutar todas las consultas en paralelo
+    const [ing1, eg1, ing2, eg2] = await Promise.all([
+      pool.query(ingresos1Query, [fecha1_desde, fecha1_hasta]),
+      pool.query(egresos1Query, [fecha1_desde, fecha1_hasta]),
+      pool.query(ingresos2Query, [fecha2_desde, fecha2_hasta]),
+      pool.query(egresos2Query, [fecha2_desde, fecha2_hasta])
+    ]);
+
+    const ingresos1 = parseFloat(ing1.rows[0].total) || 0;
+    const cantidad_ventas1 = parseInt(ing1.rows[0].cantidad) || 0;
+    const egresos1 = parseFloat(eg1.rows[0].total) || 0;
+    const cantidad_egresos1 = parseInt(eg1.rows[0].cantidad) || 0;
+    const utilidad1 = ingresos1 - egresos1;
+
+    const ingresos2 = parseFloat(ing2.rows[0].total) || 0;
+    const cantidad_ventas2 = parseInt(ing2.rows[0].cantidad) || 0;
+    const egresos2 = parseFloat(eg2.rows[0].total) || 0;
+    const cantidad_egresos2 = parseInt(eg2.rows[0].cantidad) || 0;
+    const utilidad2 = ingresos2 - egresos2;
+
+    // Generar labels automáticos
+    const generarLabel = (desde, hasta) => {
+      if (desde === hasta) {
+        const [y, m, d] = desde.split('-');
+        const meses = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+        return `${parseInt(d)} ${meses[parseInt(m) - 1]} ${y}`;
+      }
+      
+      const [yD, mD] = desde.split('-');
+      const [yH, mH] = hasta.split('-');
+      
+      if (yD === yH && mD === mH) {
+        const meses = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+        return `${meses[parseInt(mD) - 1]} ${yD}`;
+      }
+      
+      if (desde.endsWith('-01-01') && hasta.endsWith('-12-31') && yD === yH) {
+        return `Año ${yD}`;
+      }
+      
+      return `${desde} - ${hasta}`;
+    };
+
+    res.json({
+      periodo1: {
+        label: generarLabel(fecha1_desde, fecha1_hasta),
+        datos: {
+          ingresos: ingresos1,
+          egresos: egresos1,
+          utilidad: utilidad1,
+          cantidad_ventas: cantidad_ventas1,
+          cantidad_egresos: cantidad_egresos1
+        }
+
+        
+      },
+      periodo2: {
+        label: generarLabel(fecha2_desde, fecha2_hasta),
+        datos: {
+          ingresos: ingresos2,
+          egresos: egresos2,
+          utilidad: utilidad2,
+          cantidad_ventas: cantidad_ventas2,
+          cantidad_egresos: cantidad_egresos2
+        }
+      },
+      diferencia: {
+        ingresos: ingresos2 - ingresos1,
+        egresos: egresos2 - egresos1,
+        utilidad: utilidad2 - utilidad1
+      }
+    });
+
+  } catch (e) {
+    console.error("ERROR /api/comparar-periodos:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== AGREGAR ESTE ENDPOINT EN TU server.js =====================
+// Colócalo junto con los otros endpoints, antes de app.listen
+
+app.get("/api/comparar-ventas", async (req, res) => {
+  try {
+    const { fecha1_desde, fecha1_hasta, fecha2_desde, fecha2_hasta } = req.query;
+    
+    if (!fecha1_desde || !fecha1_hasta || !fecha2_desde || !fecha2_hasta) {
+      return res.status(400).json({ 
+        error: "Faltan parámetros obligatorios: fecha1_desde, fecha1_hasta, fecha2_desde, fecha2_hasta" 
+      });
+    }
+
+    // PERIODO 1 - Ventas (solo ventas PAGADAS y NO ANULADAS)
+    const ventas1Query = `
+      SELECT 
+        COALESCE(SUM(vd.precio_venta), 0) as total_ventas,
+        COUNT(DISTINCT v.id) as cantidad_ventas
+      FROM ventas v
+      LEFT JOIN ventas_detalle vd ON v.id = vd.venta_id
+      WHERE v.date_order >= $1 
+        AND v.date_order <= $2
+        AND v.pagado = true
+        AND (v.anulado = false OR v.anulado IS NULL)
+    `;
+
+    // PERIODO 2 - Ventas
+    const ventas2Query = `
+      SELECT 
+        COALESCE(SUM(vd.precio_venta), 0) as total_ventas,
+        COUNT(DISTINCT v.id) as cantidad_ventas
+      FROM ventas v
+      LEFT JOIN ventas_detalle vd ON v.id = vd.venta_id
+      WHERE v.date_order >= $1 
+        AND v.date_order <= $2
+        AND v.pagado = true
+        AND (v.anulado = false OR v.anulado IS NULL)
+    `;
+
+    // Ejecutar consultas en paralelo
+    const [v1, v2] = await Promise.all([
+      pool.query(ventas1Query, [fecha1_desde, fecha1_hasta]),
+      pool.query(ventas2Query, [fecha2_desde, fecha2_hasta])
+    ]);
+
+    const total_ventas1 = parseFloat(v1.rows[0].total_ventas) || 0;
+    const cantidad_ventas1 = parseInt(v1.rows[0].cantidad_ventas) || 0;
+    const ticket_promedio1 = cantidad_ventas1 > 0 ? total_ventas1 / cantidad_ventas1 : 0;
+
+    const total_ventas2 = parseFloat(v2.rows[0].total_ventas) || 0;
+    const cantidad_ventas2 = parseInt(v2.rows[0].cantidad_ventas) || 0;
+    const ticket_promedio2 = cantidad_ventas2 > 0 ? total_ventas2 / cantidad_ventas2 : 0;
+
+    // Generar labels automáticos
+    const generarLabel = (desde, hasta) => {
+      if (desde === hasta) {
+        const [y, m, d] = desde.split('-');
+        const meses = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+        return `${parseInt(d)} ${meses[parseInt(m) - 1]} ${y}`;
+      }
+      
+      const [yD, mD] = desde.split('-');
+      const [yH, mH] = hasta.split('-');
+      
+      if (yD === yH && mD === mH) {
+        const meses = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+        return `${meses[parseInt(mD) - 1]} ${yD}`;
+      }
+      
+      if (desde.endsWith('-01-01') && hasta.endsWith('-12-31') && yD === yH) {
+        return `Año ${yD}`;
+      }
+      
+      return `${desde} - ${hasta}`;
+    };
+
+    res.json({
+      periodo1: {
+        label: generarLabel(fecha1_desde, fecha1_hasta),
+        datos: {
+          total_ventas: total_ventas1,
+          cantidad_ventas: cantidad_ventas1,
+          ticket_promedio: ticket_promedio1
+        }
+      },
+      periodo2: {
+        label: generarLabel(fecha2_desde, fecha2_hasta),
+        datos: {
+          total_ventas: total_ventas2,
+          cantidad_ventas: cantidad_ventas2,
+          ticket_promedio: ticket_promedio2
+        }
+      },
+      diferencia: {
+        total_ventas: total_ventas2 - total_ventas1,
+        cantidad_ventas: cantidad_ventas2 - cantidad_ventas1,
+        ticket_promedio: ticket_promedio2 - ticket_promedio1
+      }
+    });
+
+  } catch (e) {
+    console.error("ERROR /api/comparar-ventas:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===================== FIN DEL ENDPOINT =====================
 
 // Llama a la función al inicio (después de crearTablas)
 agregarUpdatedAtPedidos();
